@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use git_rust::{
     error::{GitError, GitResult},
     object::{Blob, GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
+    tree::Tree,
 };
 
 #[derive(Parser)]
@@ -33,6 +34,12 @@ enum Commands {
         write: bool,
         path: PathBuf,
     },
+    #[command(name = "ls-tree")]
+    LsTree {
+        #[arg(long)]
+        name_only: bool,
+        tree_sha: String,
+    },
 }
 
 fn run(cli: Cli) -> GitResult<()> {
@@ -40,6 +47,10 @@ fn run(cli: Cli) -> GitResult<()> {
         Commands::Init => run_init()?,
         Commands::CatFile { pretty, object } => run_cat_file(pretty, object)?,
         Commands::HashObject { write, path } => run_hash_object(write, path)?,
+        Commands::LsTree {
+            name_only,
+            tree_sha,
+        } => run_ls_tree(name_only, tree_sha)?,
     }
     Ok(())
 }
@@ -92,6 +103,17 @@ fn run_hash_object(write: bool, path: PathBuf) -> GitResult<()> {
     }
     let hash = Blob::write_from_path(&path)?;
     println!("{hash}");
+    Ok(())
+}
+
+fn run_ls_tree(name_only: bool, tree_sha: String) -> GitResult<()> {
+    if !name_only {
+        return Err(GitError::LsTreeNameOnlyRequired);
+    }
+    let tree = Tree::read(&tree_sha)?;
+    for entry in &tree {
+        println!("{}", entry.name);
+    }
     Ok(())
 }
 

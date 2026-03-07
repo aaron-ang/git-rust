@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use sha1::{Digest, Sha1};
 
@@ -11,11 +12,22 @@ pub const GIT_REFS_DIR: &str = "refs";
 pub const GIT_HEAD_FILE: &str = "HEAD";
 pub const GIT_HEAD_CONTENT: &str = "ref: refs/heads/main\n";
 
-/// Git blob object: file content only (no name or permissions).
-#[derive(Debug, Clone)]
-pub struct Blob {
-    content: Vec<u8>,
+pub(crate) fn object_path(hash: &str) -> Result<PathBuf> {
+    object_path_in(Path::new(GIT_DIR), hash)
 }
+
+fn object_path_in(git_dir: &Path, hash: &str) -> Result<PathBuf> {
+    if hash.len() != 40 {
+        bail!("object hash must be 40 characters, got {}", hash.len());
+    }
+    let prefix = &hash[..2];
+    let suffix = &hash[2..];
+    Ok(git_dir.join(GIT_OBJECTS_DIR).join(prefix).join(suffix))
+}
+
+/// Git blob object: file content only (no name or permissions).
+#[derive(Debug)]
+pub struct Blob(Vec<u8>);
 
 impl Blob {
     /// Reads a file from disk, stores it as a Git blob object and returns its hash.
@@ -33,14 +45,14 @@ impl Blob {
     }
 
     /// Reads a blob from the Git object store by hash and returns its content.
-    pub fn read(hash: &str) -> Result<Vec<u8>> {
+    pub fn read(hash: &str) -> Result<Blob> {
         let path = Self::object_path(hash)?;
         let compressed = std::fs::read(&path)?;
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed)?;
         let blob = Self::parse(&decompressed)?;
-        Ok(blob.content)
+        Ok(blob)
     }
 
     /// Parses decompressed blob object bytes.
@@ -48,7 +60,7 @@ impl Blob {
     fn parse(data: &[u8]) -> Result<Self> {
         const BLOB_PREFIX: &[u8] = b"blob ";
         if !data.starts_with(BLOB_PREFIX) {
-            return Err(anyhow!("invalid blob: expected 'blob' header"));
+            bail!("invalid blob: expected 'blob' header");
         }
         let after_prefix = &data[BLOB_PREFIX.len()..];
         let null_pos = after_prefix
@@ -62,7 +74,7 @@ impl Blob {
             .parse()
             .map_err(|_| anyhow!("invalid blob: size is not a number"))?;
         let content = after_prefix[null_pos + 1..].to_vec();
-        Ok(Blob { content })
+        Ok(Blob(content))
     }
 
     /// Builds uncompressed blob payload bytes: `blob <size>\0<content>`.
@@ -78,7 +90,7 @@ impl Blob {
     }
 
     fn write_object_payload_in(git_dir: &Path, hash: &str, payload: &[u8]) -> Result<()> {
-        let path = Self::object_path_in(git_dir, hash)?;
+        let path = object_path_in(git_dir, hash)?;
         if path.exists() {
             return Ok(());
         }
@@ -95,19 +107,21 @@ impl Blob {
     /// Returns the path to a Git object file from its 40-character SHA-1 hash.
     /// Path format: `.git/objects/<first_2_chars>/<remaining_38_chars>`.
     fn object_path(hash: &str) -> Result<PathBuf> {
-        Self::object_path_in(Path::new(GIT_DIR), hash)
+        object_path(hash)
     }
+}
 
-    fn object_path_in(git_dir: &Path, hash: &str) -> Result<PathBuf> {
-        if hash.len() != 40 {
-            return Err(anyhow!(
-                "object hash must be 40 characters, got {}",
-                hash.len()
-            ));
-        }
-        let prefix = &hash[..2];
-        let suffix = &hash[2..];
-        Ok(git_dir.join(GIT_OBJECTS_DIR).join(prefix).join(suffix))
+impl Deref for Blob {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> PartialEq<[u8; N]> for Blob {
+    fn eq(&self, other: &[u8; N]) -> bool {
+        self.0 == other.as_slice()
     }
 }
 
@@ -137,21 +151,21 @@ mod tests {
     fn test_parse_blob_hello_world() {
         let data = b"blob 11\0hello world";
         let blob = Blob::parse(data).unwrap();
-        assert_eq!(blob.content, b"hello world");
+        assert_eq!(&blob, b"hello world");
     }
 
     #[test]
     fn test_parse_blob_no_trailing_newline() {
         let data = b"blob 5\0abcde";
         let blob = Blob::parse(data).unwrap();
-        assert_eq!(blob.content, b"abcde");
+        assert_eq!(&blob, b"abcde");
     }
 
     #[test]
     fn test_parse_blob_empty_content() {
         let data = b"blob 0\0";
         let blob = Blob::parse(data).unwrap();
-        assert_eq!(blob.content, b"");
+        assert_eq!(&blob, b"");
     }
 
     #[test]
@@ -195,7 +209,7 @@ mod tests {
         Blob::write_object_payload_in(&git_dir, &hash, &payload).unwrap();
         Blob::write_object_payload_in(&git_dir, &hash, &payload).unwrap();
 
-        let object_path = Blob::object_path_in(&git_dir, &hash).unwrap();
+        let object_path = object_path_in(&git_dir, &hash).unwrap();
         assert!(object_path.exists());
 
         let compressed = std::fs::read(object_path).unwrap();

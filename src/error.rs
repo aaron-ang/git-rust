@@ -13,6 +13,9 @@ pub enum GitError {
     #[error("fatal: '-w' is required")]
     HashObjectWriteRequired,
 
+    #[error("fatal: '--name-only' is required")]
+    LsTreeNameOnlyRequired,
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
