@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, GitError>;
+pub type GitResult<T> = Result<T, GitError>;
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -9,6 +9,9 @@ pub enum GitError {
 
     #[error("fatal: only two arguments allowed in <type> <object> mode, not {0}")]
     CatFileTypeObjectMode(u32),
+
+    #[error("fatal: '-w' is required")]
+    HashObjectWriteRequired,
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
