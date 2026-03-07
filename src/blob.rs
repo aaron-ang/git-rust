@@ -1,12 +1,13 @@
-use std::ops::Deref;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
+use derive_more::{AsRef, Deref};
 
 use crate::object::{ObjectStore, ObjectType};
 
 /// Git blob object: file content only (no name or permissions).
-#[derive(Debug)]
+#[derive(Debug, Deref, AsRef)]
+#[as_ref(forward)]
 pub struct Blob(Vec<u8>);
 
 impl Blob {
@@ -55,14 +56,6 @@ impl Blob {
             .parse()
             .map_err(|_| anyhow!("invalid blob: size is not a number"))?;
         Ok(Self(after_prefix[null_pos + 1..].to_vec()))
-    }
-}
-
-impl Deref for Blob {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

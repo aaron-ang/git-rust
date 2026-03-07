@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 pub type GitResult<T> = Result<T, GitError>;
@@ -10,11 +11,14 @@ pub enum GitError {
     #[error("fatal: only two arguments allowed in <type> <object> mode, not {0}")]
     CatFileTypeObjectMode(u32),
 
-    #[error("fatal: '-w' is required")]
-    HashObjectWriteRequired,
+    #[error("fatal: '{0}' is required")]
+    RequiredFlag(&'static str),
 
-    #[error("fatal: '--name-only' is required")]
-    LsTreeNameOnlyRequired,
+    #[error("fatal: destination path '{0}' already exists and is not an empty directory.")]
+    CloneTargetNotEmpty(PathBuf),
+
+    #[error("fatal: No directory name could be guessed.\nPlease specify a target directory on the command line")]
+    CantGuessCloneTarget,
 
     #[error(transparent)]
     Io(#[from] std::io::Error),

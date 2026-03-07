@@ -1,20 +1,15 @@
-use std::{ops::Deref, path::Path};
+use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
-use strum::{Display, EnumString};
+use derive_more::{Deref, Display};
+use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 
 use crate::{
     blob::Blob,
     object::{GIT_DIR, ObjectStore, ObjectType},
 };
 
-pub struct TreeEntry {
-    mode: String,
-    pub name: String,
-    hash: String,
-}
-
-#[derive(Display, EnumString)]
+#[derive(Debug, StrumDisplay, EnumString, AsRefStr, PartialEq)]
 enum TreeEntryMode {
     #[strum(serialize = "100644")]
     RegularFile,
@@ -24,6 +19,15 @@ enum TreeEntryMode {
     Directory,
 }
 
+#[derive(Display)]
+#[display("{name}")]
+pub struct TreeEntry {
+    mode: TreeEntryMode,
+    name: String,
+    hash: String,
+}
+
+#[derive(Deref)]
 pub struct Tree(Vec<TreeEntry>);
 
 impl Tree {
@@ -31,15 +35,40 @@ impl Tree {
         Self::read_from(&ObjectStore::default(), hash)
     }
 
-    fn read_from(store: &ObjectStore, hash: &str) -> Result<Self> {
-        let data = store.read_object(hash)?;
-        Self::parse(&data)
-    }
-
     pub fn write_current_dir() -> Result<String> {
         let cwd = std::env::current_dir()?;
         let store = ObjectStore::default();
         Self::write_dir(&store, &cwd)
+    }
+
+    pub fn checkout_in(store: &ObjectStore, tree_sha: &str, root: &Path) -> Result<()> {
+        let tree = Self::read_from(store, tree_sha)?;
+        for entry in tree.iter() {
+            let path = root.join(&entry.name);
+            if entry.mode == TreeEntryMode::Directory {
+                std::fs::create_dir_all(&path)?;
+                Self::checkout_in(store, &entry.hash, &path)?;
+                continue;
+            }
+
+            let blob = Blob::read_from(store, &entry.hash)?;
+            std::fs::write(&path, blob)?;
+
+            #[cfg(unix)]
+            if entry.mode == TreeEntryMode::ExecutableFile {
+                use std::os::unix::fs::PermissionsExt;
+
+                let mut permissions = std::fs::metadata(&path)?.permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_from(store: &ObjectStore, hash: &str) -> Result<Self> {
+        let data = store.read_object(hash)?;
+        Self::parse(&data)
     }
 
     fn write_dir(store: &ObjectStore, dir: &Path) -> Result<String> {
@@ -61,14 +90,14 @@ impl Tree {
             if metadata.is_file() {
                 let hash = Blob::write_from_path_in(store, &path)?;
                 entries.push(TreeEntry {
-                    mode: TreeEntryMode::RegularFile.to_string(),
+                    mode: TreeEntryMode::RegularFile,
                     name,
                     hash,
                 });
             } else if metadata.is_dir() {
                 let hash = Self::write_dir(store, &path)?;
                 entries.push(TreeEntry {
-                    mode: TreeEntryMode::Directory.to_string(),
+                    mode: TreeEntryMode::Directory,
                     name,
                     hash,
                 });
@@ -108,8 +137,8 @@ impl Tree {
 
     fn serialize(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
-        for entry in &self.0 {
-            body.extend_from_slice(entry.mode.as_bytes());
+        for entry in self.iter() {
+            body.extend_from_slice(entry.mode.as_ref().as_bytes());
             body.push(b' ');
             body.extend_from_slice(entry.name.as_bytes());
             body.push(0);
@@ -148,7 +177,8 @@ impl Tree {
             .ok_or_else(|| anyhow!("invalid tree entry: missing mode/name separator"))?;
         let mode = std::str::from_utf8(&data[..mode_end])
             .map_err(|_| anyhow!("invalid tree entry: mode is not UTF-8"))?
-            .to_string();
+            .parse::<TreeEntryMode>()
+            .map_err(|_| anyhow!("invalid tree entry: unsupported mode"))?;
 
         let after_mode = &data[mode_end + 1..];
         let name_end = after_mode
@@ -171,23 +201,6 @@ impl Tree {
             hash: ObjectStore::hash_bytes_to_hex(&after_name[..20]),
         };
         Ok((entry, &after_name[20..]))
-    }
-}
-
-impl Deref for Tree {
-    type Target = [TreeEntry];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> IntoIterator for &'a Tree {
-    type Item = &'a TreeEntry;
-    type IntoIter = std::slice::Iter<'a, TreeEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
     }
 }
 
@@ -233,10 +246,10 @@ mod tests {
 
         let tree = Tree::parse(&data).unwrap();
         assert_eq!(tree.len(), 2);
-        assert_eq!(tree[0].mode, "40000");
+        assert_eq!(tree[0].mode, TreeEntryMode::Directory);
         assert_eq!(tree[0].name, "dir1");
         assert_eq!(tree[0].hash, SAMPLE_TREE_HASH);
-        assert_eq!(tree[1].mode, "100644");
+        assert_eq!(tree[1].mode, TreeEntryMode::RegularFile);
         assert_eq!(tree[1].name, "file1");
         assert_eq!(tree[1].hash, HELLO_WORLD_BLOB_HASH);
     }
@@ -270,7 +283,7 @@ mod tests {
     #[test]
     fn test_serialize_tree_uses_raw_sha_bytes() {
         let tree = Tree(vec![TreeEntry {
-            mode: TreeEntryMode::RegularFile.to_string(),
+            mode: TreeEntryMode::RegularFile,
             name: "file1".to_string(),
             hash: HELLO_WORLD_BLOB_HASH.to_string(),
         }]);

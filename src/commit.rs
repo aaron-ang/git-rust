@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 
 use crate::object::{ObjectStore, ObjectType};
 
@@ -31,6 +31,14 @@ impl Commit {
         store.write_object(ObjectType::Commit, &commit.serialize())
     }
 
+    pub fn root_tree_in(store: &ObjectStore, hash: &str) -> Result<String> {
+        let (object_type, body) = store.read_object_body(hash)?;
+        if object_type != ObjectType::Commit {
+            bail!("object is not a commit");
+        }
+        Self::parse_root_tree(&body)
+    }
+
     fn serialize(&self) -> Vec<u8> {
         format!(
             "tree {}\nparent {}\nauthor {} <{}> {}\ncommitter {} <{}> {}\n\n{}\n",
@@ -45,6 +53,15 @@ impl Commit {
             self.message
         )
         .into_bytes()
+    }
+
+    fn parse_root_tree(body: &[u8]) -> Result<String> {
+        let text = std::str::from_utf8(body).map_err(|_| anyhow!("commit body is not UTF-8"))?;
+        let tree_line = text
+            .lines()
+            .find(|line| line.starts_with("tree "))
+            .ok_or_else(|| anyhow!("commit body missing tree line"))?;
+        Ok(tree_line.trim_start_matches("tree ").to_string())
     }
 }
 
@@ -96,5 +113,18 @@ committer {AUTHOR_NAME} <{AUTHOR_EMAIL}> {AUTHOR_TIMESTAMP}\n\
 {MESSAGE}\n"
         );
         assert_eq!(payload, format!("commit {}\0{}", body.len(), body));
+    }
+
+    #[test]
+    fn test_parse_root_tree() {
+        let body = format!(
+            "tree {TREE_SHA}\n\
+parent {PARENT_SHA}\n\
+author {AUTHOR_NAME} <{AUTHOR_EMAIL}> {AUTHOR_TIMESTAMP}\n\
+committer {AUTHOR_NAME} <{AUTHOR_EMAIL}> {AUTHOR_TIMESTAMP}\n\
+\n\
+{MESSAGE}\n"
+        );
+        assert_eq!(Commit::parse_root_tree(body.as_bytes()).unwrap(), TREE_SHA);
     }
 }

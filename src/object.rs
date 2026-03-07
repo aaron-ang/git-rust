@@ -12,7 +12,7 @@ pub const GIT_REFS_DIR: &str = "refs";
 pub const GIT_HEAD_FILE: &str = "HEAD";
 pub const GIT_HEAD_CONTENT: &str = "ref: refs/heads/main\n";
 
-#[derive(Display, EnumString)]
+#[derive(Clone, Copy, PartialEq, Display, EnumString)]
 #[strum(serialize_all = "lowercase")]
 pub enum ObjectType {
     Blob,
@@ -60,6 +60,36 @@ impl ObjectStore {
         Ok(decompressed)
     }
 
+    pub fn read_object_body(&self, hash: &str) -> Result<(ObjectType, Vec<u8>)> {
+        let payload = self.read_object(hash)?;
+        let null_pos = payload
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| anyhow!("invalid object: missing null byte after header"))?;
+
+        let header = std::str::from_utf8(&payload[..null_pos])
+            .map_err(|_| anyhow!("invalid object: header is not UTF-8"))?;
+        let (kind, size) = header
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("invalid object: malformed header"))?;
+        let object_type = kind
+            .parse::<ObjectType>()
+            .map_err(|_| anyhow!("invalid object: unsupported type: {kind}"))?;
+
+        let body = payload[null_pos + 1..].to_vec();
+        let expected_size: usize = size
+            .parse()
+            .map_err(|_| anyhow!("invalid object: size is not a number"))?;
+        if body.len() != expected_size {
+            bail!(
+                "invalid object: size mismatch, header says {}, body is {}",
+                expected_size,
+                body.len()
+            );
+        }
+        Ok((object_type, body))
+    }
+
     pub(crate) fn hash_bytes_to_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -74,6 +104,11 @@ impl ObjectStore {
                     .map_err(|_| anyhow!("object hash contains non-hex characters"))
             })
             .collect()
+    }
+
+    pub(crate) fn object_hash(object_type: ObjectType, body: &[u8]) -> String {
+        let payload = Self::serialize_object(object_type, body);
+        Self::hash_payload(&payload)
     }
 
     fn write_payload(&self, hash: &str, payload: &[u8]) -> Result<()> {
