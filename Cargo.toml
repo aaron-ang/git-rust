@@ -1,12 +1,13 @@
 [package]
-name = "codecrafters-git"
+name = "git-rust"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
+authors = ["Aaron Ang <aaron.angyd@gmail.com>"]
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.93"
 
 [dependencies]
 anyhow = "1.0.102"
 bytes = "1.11.1"
+clap = { version = "4.5.60", features = ["derive"] }
 flate2 = "1.1.9"
 thiserror = "2.0.18"
