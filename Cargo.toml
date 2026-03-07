@@ -1,16 +1,18 @@
 [package]
 name = "git-rust"
 version = "0.1.0"
-authors = ["Aaron Ang <aaron.angyd@gmail.com>"]
 edition = "2024"
+authors = ["Aaron Ang <aaron.angyd@gmail.com>"]
+description = "A minimal Git implementation in Rust."
 rust-version = "1.93"
 
 [dependencies]
 anyhow = "1.0.102"
 bytes = "1.11.1"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive", "cargo"] }
 flate2 = "1.1.9"
 sha1 = "0.10.6"
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]

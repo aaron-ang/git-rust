@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::object::ObjectStore;
+use crate::object::{ObjectStore, ObjectType};
 
 /// Git blob object: file content only (no name or permissions).
 #[derive(Debug)]
@@ -33,7 +33,7 @@ impl Blob {
     }
 
     pub(crate) fn write_content_in(store: &ObjectStore, content: &[u8]) -> Result<String> {
-        store.write_object("blob", content)
+        store.write_object(ObjectType::Blob, content)
     }
 
     /// Parses decompressed blob object bytes.

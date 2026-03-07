@@ -4,12 +4,21 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use sha1::{Digest, Sha1};
+use strum::{Display, EnumString};
 
 pub const GIT_DIR: &str = ".git";
 pub const GIT_OBJECTS_DIR: &str = "objects";
 pub const GIT_REFS_DIR: &str = "refs";
 pub const GIT_HEAD_FILE: &str = "HEAD";
 pub const GIT_HEAD_CONTENT: &str = "ref: refs/heads/main\n";
+
+#[derive(Display, EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum ObjectType {
+    Blob,
+    Tree,
+    Commit,
+}
 
 pub struct ObjectStore {
     git_dir: PathBuf,
@@ -35,7 +44,7 @@ impl ObjectStore {
         Ok(self.git_dir.join(GIT_OBJECTS_DIR).join(prefix).join(suffix))
     }
 
-    pub fn write_object(&self, object_type: &str, body: &[u8]) -> Result<String> {
+    pub fn write_object(&self, object_type: ObjectType, body: &[u8]) -> Result<String> {
         let payload = Self::serialize_object(object_type, body);
         let hash = Self::hash_payload(&payload);
         self.write_payload(&hash, &payload)?;
@@ -82,8 +91,8 @@ impl ObjectStore {
         Ok(())
     }
 
-    fn serialize_object(object_type: &str, body: &[u8]) -> Vec<u8> {
-        let mut payload = format!("{object_type} {}\0", body.len()).into_bytes();
+    fn serialize_object(object_type: ObjectType, body: &[u8]) -> Vec<u8> {
+        let mut payload = format!("{} {}\0", object_type, body.len()).into_bytes();
         payload.extend_from_slice(body);
         payload
     }
@@ -123,9 +132,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let store = ObjectStore::new(temp.path().join(GIT_DIR));
 
-        let hash = store.write_object("blob", b"hello world\n").unwrap();
+        let hash = store
+            .write_object(ObjectType::Blob, b"hello world\n")
+            .unwrap();
         let payload = store.read_object(&hash).unwrap();
-        let second_hash = store.write_object("blob", b"hello world\n").unwrap();
+        let second_hash = store
+            .write_object(ObjectType::Blob, b"hello world\n")
+            .unwrap();
 
         assert_eq!(hash, second_hash);
         assert_eq!(payload, b"blob 12\0hello world\n");

@@ -7,13 +7,14 @@ use clap::{Parser, Subcommand};
 
 use git_rust::{
     blob::Blob,
+    commit::Commit,
     error::{GitError, GitResult},
     object::{GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
     tree::Tree,
 };
 
 #[derive(Parser)]
-#[command(name = "git-rust", about = "A minimal Git implementation in Rust.")]
+#[command(version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -39,7 +40,24 @@ enum Commands {
         name_only: bool,
         tree_sha: String,
     },
+    CommitTree {
+        tree_sha: String,
+        #[arg(short)]
+        parent: String,
+        #[arg(short)]
+        message: String,
+    },
     WriteTree,
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::from(GitError::EXIT_CODE)
+        }
+    }
 }
 
 fn run(cli: Cli) -> GitResult<()> {
@@ -51,6 +69,11 @@ fn run(cli: Cli) -> GitResult<()> {
             name_only,
             tree_sha,
         } => run_ls_tree(name_only, tree_sha)?,
+        Commands::CommitTree {
+            tree_sha,
+            parent,
+            message,
+        } => run_commit_tree(tree_sha, parent, message)?,
         Commands::WriteTree => run_write_tree()?,
     }
     Ok(())
@@ -124,12 +147,8 @@ fn run_write_tree() -> GitResult<()> {
     Ok(())
 }
 
-fn main() -> ExitCode {
-    match run(Cli::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("{err}");
-            ExitCode::from(GitError::EXIT_CODE)
-        }
-    }
+fn run_commit_tree(tree_sha: String, parent: String, message: String) -> GitResult<()> {
+    let hash = Commit::write(&tree_sha, &parent, &message)?;
+    println!("{hash}");
+    Ok(())
 }

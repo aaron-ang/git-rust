@@ -1,18 +1,27 @@
-use anyhow::{Result, anyhow, bail};
 use std::{ops::Deref, path::Path};
+
+use anyhow::{Result, anyhow, bail};
+use strum::{Display, EnumString};
 
 use crate::{
     blob::Blob,
-    object::{GIT_DIR, ObjectStore},
+    object::{GIT_DIR, ObjectStore, ObjectType},
 };
-
-pub const TREE_MODE: &str = "40000"; // Directory
-pub const BLOB_MODE: &str = "100644"; // File
 
 pub struct TreeEntry {
     mode: String,
     pub name: String,
     hash: String,
+}
+
+#[derive(Display, EnumString)]
+enum TreeEntryMode {
+    #[strum(serialize = "100644")]
+    RegularFile,
+    #[strum(serialize = "100755")]
+    ExecutableFile,
+    #[strum(serialize = "40000")]
+    Directory,
 }
 
 pub struct Tree(Vec<TreeEntry>);
@@ -52,14 +61,14 @@ impl Tree {
             if metadata.is_file() {
                 let hash = Blob::write_from_path_in(store, &path)?;
                 entries.push(TreeEntry {
-                    mode: BLOB_MODE.to_string(),
+                    mode: TreeEntryMode::RegularFile.to_string(),
                     name,
                     hash,
                 });
             } else if metadata.is_dir() {
                 let hash = Self::write_dir(store, &path)?;
                 entries.push(TreeEntry {
-                    mode: TREE_MODE.to_string(),
+                    mode: TreeEntryMode::Directory.to_string(),
                     name,
                     hash,
                 });
@@ -75,7 +84,7 @@ impl Tree {
 
     fn write(&self, store: &ObjectStore) -> Result<String> {
         let body = self.serialize()?;
-        store.write_object("tree", &body)
+        store.write_object(ObjectType::Tree, &body)
     }
 
     fn parse(data: &[u8]) -> Result<Self> {
@@ -261,7 +270,7 @@ mod tests {
     #[test]
     fn test_serialize_tree_uses_raw_sha_bytes() {
         let tree = Tree(vec![TreeEntry {
-            mode: BLOB_MODE.to_string(),
+            mode: TreeEntryMode::RegularFile.to_string(),
             name: "file1".to_string(),
             hash: HELLO_WORLD_BLOB_HASH.to_string(),
         }]);
