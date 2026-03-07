@@ -1,25 +1,81 @@
 use anyhow::{Result, anyhow, bail};
-use flate2::read::ZlibDecoder;
-use std::{io::Read, ops::Deref};
+use std::{ops::Deref, path::Path};
 
-use crate::object::object_path;
+use crate::{
+    blob::Blob,
+    object::{GIT_DIR, ObjectStore},
+};
+
+pub const TREE_MODE: &str = "40000"; // Directory
+pub const BLOB_MODE: &str = "100644"; // File
 
 pub struct TreeEntry {
-    pub mode: String,
+    mode: String,
     pub name: String,
-    pub hash: String,
+    hash: String,
 }
 
 pub struct Tree(Vec<TreeEntry>);
 
 impl Tree {
     pub fn read(hash: &str) -> Result<Self> {
-        let path = object_path(hash)?;
-        let compressed = std::fs::read(path)?;
-        let mut decoder = ZlibDecoder::new(compressed.as_slice());
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
-        Self::parse(&decompressed)
+        Self::read_from(&ObjectStore::default(), hash)
+    }
+
+    fn read_from(store: &ObjectStore, hash: &str) -> Result<Self> {
+        let data = store.read_object(hash)?;
+        Self::parse(&data)
+    }
+
+    pub fn write_current_dir() -> Result<String> {
+        let cwd = std::env::current_dir()?;
+        let store = ObjectStore::default();
+        Self::write_dir(&store, &cwd)
+    }
+
+    fn write_dir(store: &ObjectStore, dir: &Path) -> Result<String> {
+        let mut entries = Vec::new();
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if file_name == GIT_DIR {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            let name = file_name
+                .into_string()
+                .map_err(|_| anyhow!("invalid UTF-8 path name"))?;
+
+            if metadata.is_file() {
+                let hash = Blob::write_from_path_in(store, &path)?;
+                entries.push(TreeEntry {
+                    mode: BLOB_MODE.to_string(),
+                    name,
+                    hash,
+                });
+            } else if metadata.is_dir() {
+                let hash = Self::write_dir(store, &path)?;
+                entries.push(TreeEntry {
+                    mode: TREE_MODE.to_string(),
+                    name,
+                    hash,
+                });
+            } else {
+                bail!("unsupported directory entry type: {}", path.display());
+            }
+        }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let tree = Self(entries);
+        tree.write(store)
+    }
+
+    fn write(&self, store: &ObjectStore) -> Result<String> {
+        let body = self.serialize()?;
+        store.write_object("tree", &body)
     }
 
     fn parse(data: &[u8]) -> Result<Self> {
@@ -39,6 +95,18 @@ impl Tree {
         }
 
         Ok(Self(entries))
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        for entry in &self.0 {
+            body.extend_from_slice(entry.mode.as_bytes());
+            body.push(b' ');
+            body.extend_from_slice(entry.name.as_bytes());
+            body.push(0);
+            body.extend_from_slice(&ObjectStore::hash_hex_to_bytes(&entry.hash)?);
+        }
+        Ok(body)
     }
 
     fn parse_body(data: &[u8]) -> Result<(usize, &[u8])> {
@@ -91,13 +159,9 @@ impl Tree {
         let entry = TreeEntry {
             mode,
             name,
-            hash: Self::hash_bytes_to_hex(&after_name[..20]),
+            hash: ObjectStore::hash_bytes_to_hex(&after_name[..20]),
         };
         Ok((entry, &after_name[20..]))
-    }
-
-    fn hash_bytes_to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -121,6 +185,13 @@ impl<'a> IntoIterator for &'a Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    use crate::object::GIT_OBJECTS_DIR;
+
+    const SAMPLE_TREE_HASH: &str = "1111111111111111111111111111111111111111";
+    const HELLO_WORLD_BLOB_HASH: &str = "95d09f2b10159347eece71399a7e2e907ea3df4f";
+    const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
     fn hex_to_20_bytes(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len(), 40);
@@ -147,22 +218,18 @@ mod tests {
     #[test]
     fn test_parse_tree_multiple_entries() {
         let data = make_tree_data(&[
-            ("40000", "dir1", "1111111111111111111111111111111111111111"),
-            (
-                "100644",
-                "file1",
-                "95d09f2b10159347eece71399a7e2e907ea3df4f",
-            ),
+            ("40000", "dir1", SAMPLE_TREE_HASH),
+            ("100644", "file1", HELLO_WORLD_BLOB_HASH),
         ]);
 
         let tree = Tree::parse(&data).unwrap();
         assert_eq!(tree.len(), 2);
         assert_eq!(tree[0].mode, "40000");
         assert_eq!(tree[0].name, "dir1");
-        assert_eq!(tree[0].hash, "1111111111111111111111111111111111111111");
+        assert_eq!(tree[0].hash, SAMPLE_TREE_HASH);
         assert_eq!(tree[1].mode, "100644");
         assert_eq!(tree[1].name, "file1");
-        assert_eq!(tree[1].hash, "95d09f2b10159347eece71399a7e2e907ea3df4f");
+        assert_eq!(tree[1].hash, HELLO_WORLD_BLOB_HASH);
     }
 
     #[test]
@@ -173,7 +240,7 @@ mod tests {
     #[test]
     fn test_parse_tree_missing_null_after_name() {
         let mut data = b"tree 31\0100644 file1".to_vec();
-        data.extend_from_slice(&hex_to_20_bytes("95d09f2b10159347eece71399a7e2e907ea3df4f"));
+        data.extend_from_slice(&hex_to_20_bytes(HELLO_WORLD_BLOB_HASH));
         assert!(Tree::parse(&data).is_err());
     }
 
@@ -189,5 +256,71 @@ mod tests {
         assert!(Tree::parse(b"tree no-number\0abc").is_err());
         assert!(Tree::parse(b"tree 7\0abc").is_err());
         assert!(Tree::parse(b"tree 3abc").is_err());
+    }
+
+    #[test]
+    fn test_serialize_tree_uses_raw_sha_bytes() {
+        let tree = Tree(vec![TreeEntry {
+            mode: BLOB_MODE.to_string(),
+            name: "file1".to_string(),
+            hash: HELLO_WORLD_BLOB_HASH.to_string(),
+        }]);
+
+        let body = tree.serialize().unwrap();
+        assert_eq!(&body[..13], b"100644 file1\0");
+        assert_eq!(&body[13..], &hex_to_20_bytes(HELLO_WORLD_BLOB_HASH));
+    }
+
+    #[test]
+    fn test_write_empty_directory_uses_canonical_empty_tree_hash() {
+        let temp = tempdir().unwrap();
+        let store = ObjectStore::new(temp.path().join(GIT_DIR));
+        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+
+        let hash = Tree::write_dir(&store, temp.path()).unwrap();
+        assert_eq!(hash, EMPTY_TREE_HASH);
+    }
+
+    #[test]
+    fn test_write_tree_sorts_entries_by_name() {
+        let temp = tempdir().unwrap();
+        let store = ObjectStore::new(temp.path().join(GIT_DIR));
+        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+
+        std::fs::write(temp.path().join("z.txt"), b"z").unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
+
+        let hash = Tree::write_dir(&store, temp.path()).unwrap();
+        let tree = Tree::read_from(&store, &hash).unwrap();
+        assert_eq!(tree[0].name, "a.txt");
+        assert_eq!(tree[1].name, "z.txt");
+    }
+
+    #[test]
+    fn test_write_tree_recurses_and_excludes_git_directory() {
+        let temp = tempdir().unwrap();
+        let store = ObjectStore::new(temp.path().join(GIT_DIR));
+        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+        std::fs::create_dir_all(temp.path().join("dir1")).unwrap();
+        std::fs::create_dir_all(temp.path().join(GIT_DIR).join("nested")).unwrap();
+
+        std::fs::write(temp.path().join("root.txt"), b"root").unwrap();
+        std::fs::write(temp.path().join("dir1").join("child.txt"), b"child").unwrap();
+        std::fs::write(
+            temp.path().join(GIT_DIR).join("nested").join("ignored.txt"),
+            b"ignored",
+        )
+        .unwrap();
+
+        let hash = Tree::write_dir(&store, temp.path()).unwrap();
+        let root_tree = Tree::read_from(&store, &hash).unwrap();
+
+        assert_eq!(root_tree.len(), 2);
+        assert_eq!(root_tree[0].name, "dir1");
+        assert_eq!(root_tree[1].name, "root.txt");
+
+        let child_tree = Tree::read_from(&store, &root_tree[0].hash).unwrap();
+        assert_eq!(child_tree.len(), 1);
+        assert_eq!(child_tree[0].name, "child.txt");
     }
 }

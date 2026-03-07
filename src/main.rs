@@ -6,8 +6,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use git_rust::{
+    blob::Blob,
     error::{GitError, GitResult},
-    object::{Blob, GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
+    object::{GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
     tree::Tree,
 };
 
@@ -19,27 +20,26 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[command(rename_all = "kebab-case")]
 enum Commands {
     Init,
-    #[command(name = "cat-file")]
     CatFile {
         #[arg(short, long)]
         pretty: bool,
         /// Object hash (40-character SHA-1)
         object: Option<String>,
     },
-    #[command(name = "hash-object")]
     HashObject {
         #[arg(short, long)]
         write: bool,
         path: PathBuf,
     },
-    #[command(name = "ls-tree")]
     LsTree {
         #[arg(long)]
         name_only: bool,
         tree_sha: String,
     },
+    WriteTree,
 }
 
 fn run(cli: Cli) -> GitResult<()> {
@@ -51,6 +51,7 @@ fn run(cli: Cli) -> GitResult<()> {
             name_only,
             tree_sha,
         } => run_ls_tree(name_only, tree_sha)?,
+        Commands::WriteTree => run_write_tree()?,
     }
     Ok(())
 }
@@ -114,6 +115,12 @@ fn run_ls_tree(name_only: bool, tree_sha: String) -> GitResult<()> {
     for entry in &tree {
         println!("{}", entry.name);
     }
+    Ok(())
+}
+
+fn run_write_tree() -> GitResult<()> {
+    let hash = Tree::write_current_dir()?;
+    println!("{hash}");
     Ok(())
 }
 
