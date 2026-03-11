@@ -17,7 +17,9 @@ pub enum GitError {
     #[error("fatal: destination path '{0}' already exists and is not an empty directory.")]
     CloneTargetNotEmpty(PathBuf),
 
-    #[error("fatal: No directory name could be guessed.\nPlease specify a target directory on the command line")]
+    #[error(
+        "fatal: No directory name could be guessed.\nPlease specify a target directory on the command line"
+    )]
     CantGuessCloneTarget,
 
     #[error(transparent)]

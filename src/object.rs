@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -53,7 +54,7 @@ impl ObjectStore {
 
     pub fn read_object(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.object_path(hash)?;
-        let compressed = std::fs::read(path)?;
+        let compressed = fs::read(path)?;
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed)?;
@@ -67,7 +68,7 @@ impl ObjectStore {
             .position(|&b| b == 0)
             .ok_or_else(|| anyhow!("invalid object: missing null byte after header"))?;
 
-        let header = std::str::from_utf8(&payload[..null_pos])
+        let header = str::from_utf8(&payload[..null_pos])
             .map_err(|_| anyhow!("invalid object: header is not UTF-8"))?;
         let (kind, size) = header
             .split_once(' ')
@@ -117,12 +118,12 @@ impl ObjectStore {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(payload)?;
         let compressed = encoder.finish()?;
-        std::fs::write(path, compressed)?;
+        fs::write(path, compressed)?;
         Ok(())
     }
 

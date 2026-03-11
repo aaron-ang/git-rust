@@ -1,4 +1,6 @@
+use std::fs;
 use std::path::Path;
+use std::str;
 
 use anyhow::{Result, anyhow, bail};
 use derive_more::{Deref, Display};
@@ -46,21 +48,21 @@ impl Tree {
         for entry in tree.iter() {
             let path = root.join(&entry.name);
             if entry.mode == TreeEntryMode::Directory {
-                std::fs::create_dir_all(&path)?;
+                fs::create_dir_all(&path)?;
                 Self::checkout_in(store, &entry.hash, &path)?;
                 continue;
             }
 
             let blob = Blob::read_from(store, &entry.hash)?;
-            std::fs::write(&path, blob)?;
+            fs::write(&path, blob)?;
 
             #[cfg(unix)]
             if entry.mode == TreeEntryMode::ExecutableFile {
                 use std::os::unix::fs::PermissionsExt;
 
-                let mut permissions = std::fs::metadata(&path)?.permissions();
+                let mut permissions = fs::metadata(&path)?.permissions();
                 permissions.set_mode(0o755);
-                std::fs::set_permissions(&path, permissions)?;
+                fs::set_permissions(&path, permissions)?;
             }
         }
         Ok(())
@@ -74,7 +76,7 @@ impl Tree {
     fn write_dir(store: &ObjectStore, dir: &Path) -> Result<String> {
         let mut entries = Vec::new();
 
-        for entry in std::fs::read_dir(dir)? {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
             if file_name == GIT_DIR {
@@ -159,7 +161,7 @@ impl Tree {
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| anyhow!("invalid tree: missing null byte after size"))?;
-        let size_str = std::str::from_utf8(&after_prefix[..null_pos])
+        let size_str = str::from_utf8(&after_prefix[..null_pos])
             .map_err(|_| anyhow!("invalid tree: size is not UTF-8"))?;
         let size = size_str
             .trim()
@@ -175,7 +177,7 @@ impl Tree {
             .iter()
             .position(|&b| b == b' ')
             .ok_or_else(|| anyhow!("invalid tree entry: missing mode/name separator"))?;
-        let mode = std::str::from_utf8(&data[..mode_end])
+        let mode = str::from_utf8(&data[..mode_end])
             .map_err(|_| anyhow!("invalid tree entry: mode is not UTF-8"))?
             .parse::<TreeEntryMode>()
             .map_err(|_| anyhow!("invalid tree entry: unsupported mode"))?;
@@ -185,7 +187,7 @@ impl Tree {
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| anyhow!("invalid tree entry: missing null byte after name"))?;
-        let name = std::str::from_utf8(&after_mode[..name_end])
+        let name = str::from_utf8(&after_mode[..name_end])
             .map_err(|_| anyhow!("invalid tree entry: name is not UTF-8"))?
             .to_string();
 
@@ -297,7 +299,7 @@ mod tests {
     fn test_write_empty_directory_uses_canonical_empty_tree_hash() {
         let temp = tempdir().unwrap();
         let store = ObjectStore::new(temp.path().join(GIT_DIR));
-        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+        fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
 
         let hash = Tree::write_dir(&store, temp.path()).unwrap();
         assert_eq!(hash, EMPTY_TREE_HASH);
@@ -307,10 +309,10 @@ mod tests {
     fn test_write_tree_sorts_entries_by_name() {
         let temp = tempdir().unwrap();
         let store = ObjectStore::new(temp.path().join(GIT_DIR));
-        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+        fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
 
-        std::fs::write(temp.path().join("z.txt"), b"z").unwrap();
-        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
+        fs::write(temp.path().join("z.txt"), b"z").unwrap();
+        fs::write(temp.path().join("a.txt"), b"a").unwrap();
 
         let hash = Tree::write_dir(&store, temp.path()).unwrap();
         let tree = Tree::read_from(&store, &hash).unwrap();
@@ -322,13 +324,13 @@ mod tests {
     fn test_write_tree_recurses_and_excludes_git_directory() {
         let temp = tempdir().unwrap();
         let store = ObjectStore::new(temp.path().join(GIT_DIR));
-        std::fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
-        std::fs::create_dir_all(temp.path().join("dir1")).unwrap();
-        std::fs::create_dir_all(temp.path().join(GIT_DIR).join("nested")).unwrap();
+        fs::create_dir_all(temp.path().join(GIT_DIR).join(GIT_OBJECTS_DIR)).unwrap();
+        fs::create_dir_all(temp.path().join("dir1")).unwrap();
+        fs::create_dir_all(temp.path().join(GIT_DIR).join("nested")).unwrap();
 
-        std::fs::write(temp.path().join("root.txt"), b"root").unwrap();
-        std::fs::write(temp.path().join("dir1").join("child.txt"), b"child").unwrap();
-        std::fs::write(
+        fs::write(temp.path().join("root.txt"), b"root").unwrap();
+        fs::write(temp.path().join("dir1").join("child.txt"), b"child").unwrap();
+        fs::write(
             temp.path().join(GIT_DIR).join("nested").join("ignored.txt"),
             b"ignored",
         )

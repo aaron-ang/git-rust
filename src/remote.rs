@@ -1,3 +1,6 @@
+use bytes::{Buf, Bytes, BytesMut};
+use std::str;
+
 use anyhow::{Result, anyhow, bail};
 use reqwest::Url;
 use reqwest::blocking::Client;
@@ -45,9 +48,9 @@ impl RemoteClient {
             .error_for_status()?
             .bytes()?;
 
-        let mut lines = parse_pkt_lines(bytes.as_ref())?.into_iter();
+        let mut lines = parse_pkt_lines(bytes)?.into_iter();
         match lines.next() {
-            Some(Some(line)) if line == b"# service=git-upload-pack\n" => {}
+            Some(Some(line)) if line.as_ref() == b"# service=git-upload-pack\n" => {}
             _ => bail!("invalid upload-pack advertisement"),
         }
         if !matches!(lines.next(), Some(None)) {
@@ -57,7 +60,7 @@ impl RemoteClient {
         let mut refs = Vec::new();
         let mut capabilities = Vec::new();
         for (idx, line) in lines.flatten().enumerate() {
-            let line = std::str::from_utf8(&line)?.trim_end_matches('\n');
+            let line = str::from_utf8(&line)?.trim_end_matches('\n');
             let (ref_line, caps) = if idx == 0 {
                 match line.split_once('\0') {
                     Some((ref_line, caps)) => (ref_line, Some(caps)),
@@ -108,7 +111,7 @@ impl RemoteClient {
         })
     }
 
-    pub fn fetch_pack(&self, want: &str, capabilities: &[String]) -> Result<Vec<u8>> {
+    pub fn fetch_packfile(&self, want: &str, capabilities: &[String]) -> Result<Bytes> {
         let mut url = self.repo_url.clone();
         url.path_segments_mut()
             .map_err(|_| anyhow!("invalid repository URL"))?
@@ -125,7 +128,7 @@ impl RemoteClient {
             format!("want {} {}\n", want, want_caps.join(" "))
         };
 
-        let mut body = Vec::new();
+        let mut body = BytesMut::new();
         body.extend_from_slice(&pkt_line(want_line.as_bytes()));
         body.extend_from_slice(b"0000");
         body.extend_from_slice(&pkt_line(b"done\n"));
@@ -135,69 +138,70 @@ impl RemoteClient {
             .post(url)
             .header("Content-Type", "application/x-git-upload-pack-request")
             .header("Accept", "application/x-git-upload-pack-result")
-            .body(body)
+            .body(body.freeze())
             .send()?
             .error_for_status()?
             .bytes()?;
 
-        strip_upload_pack_response(bytes.as_ref())
+        extract_packfile_from_response(bytes)
     }
 }
 
-fn strip_upload_pack_response(bytes: &[u8]) -> Result<Vec<u8>> {
+fn extract_packfile_from_response(mut bytes: Bytes) -> Result<Bytes> {
     if bytes.starts_with(b"PACK") {
-        return Ok(bytes.to_vec());
+        return Ok(bytes);
     }
 
-    if bytes.len() < 8 {
+    if bytes.remaining() < 8 {
         bail!("upload-pack response too short");
     }
     let len = pkt_len(&bytes[..4])?;
-    if len < 4 || bytes.len() < len {
+    if len < 4 || bytes.remaining() < len {
         bail!("invalid upload-pack response prefix");
     }
-    let prefix = &bytes[4..len];
-    if prefix != b"NAK\n" && prefix != b"ACK\n" {
+    let prefix = bytes.slice(4..len);
+    if prefix.as_ref() != b"NAK\n" && prefix.as_ref() != b"ACK\n" {
         bail!("unsupported upload-pack response prefix");
     }
-    let pack = &bytes[len..];
-    if !pack.starts_with(b"PACK") {
+
+    bytes.advance(len);
+    if !bytes.starts_with(b"PACK") {
         bail!("upload-pack response missing packfile payload");
     }
-    Ok(pack.to_vec())
+    Ok(bytes)
 }
 
-fn pkt_line(payload: &[u8]) -> Vec<u8> {
+fn pkt_line(payload: &[u8]) -> Bytes {
     let len = payload.len() + 4;
-    let mut line = format!("{len:04x}").into_bytes();
+    let mut line = BytesMut::with_capacity(len);
+    line.extend_from_slice(format!("{len:04x}").as_bytes());
     line.extend_from_slice(payload);
-    line
+    line.freeze()
 }
 
 fn pkt_len(header: &[u8]) -> Result<usize> {
     if header.len() != 4 {
         bail!("invalid pkt-line header length");
     }
-    Ok(usize::from_str_radix(std::str::from_utf8(header)?, 16)?)
+    Ok(usize::from_str_radix(str::from_utf8(header)?, 16)?)
 }
 
-fn parse_pkt_lines(mut data: &[u8]) -> Result<Vec<Option<Vec<u8>>>> {
+fn parse_pkt_lines(mut data: Bytes) -> Result<Vec<Option<Bytes>>> {
     let mut lines = Vec::new();
-    while !data.is_empty() {
-        let len = pkt_len(
-            data.get(..4)
-                .ok_or_else(|| anyhow!("truncated pkt-line header"))?,
-        )?;
-        data = &data[4..];
+    while data.has_remaining() {
+        if data.remaining() < 4 {
+            bail!("truncated pkt-line header");
+        }
+        let len = pkt_len(&data[..4])?;
+        data.advance(4);
         if len == 0 {
             lines.push(None);
             continue;
         }
-        if len < 4 || data.len() < len - 4 {
+        if len < 4 || data.remaining() < len - 4 {
             bail!("truncated pkt-line payload");
         }
-        lines.push(Some(data[..len - 4].to_vec()));
-        data = &data[len - 4..];
+        lines.push(Some(data.split_to(len - 4)));
     }
     Ok(lines)
 }
@@ -208,7 +212,7 @@ mod tests {
 
     #[test]
     fn test_parse_pkt_lines() {
-        let lines = parse_pkt_lines(b"0008NAK\n0000").unwrap();
+        let lines = parse_pkt_lines(Bytes::from_static(b"0008NAK\n0000")).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].as_deref(), Some(b"NAK\n".as_slice()));
         assert!(lines[1].is_none());
@@ -226,13 +230,13 @@ mod tests {
             b"0123456789012345678901234567890123456789 refs/heads/main\n",
         ));
 
-        let lines = parse_pkt_lines(&payload).unwrap();
+        let lines = parse_pkt_lines(Bytes::from(payload)).unwrap();
         assert_eq!(
             lines[0].as_deref(),
             Some(b"# service=git-upload-pack\n".as_slice())
         );
         assert!(lines[1].is_none());
-        let first_ref = std::str::from_utf8(lines[2].as_deref().unwrap()).unwrap();
+        let first_ref = str::from_utf8(lines[2].as_deref().unwrap()).unwrap();
         assert!(first_ref.contains("symref=HEAD:refs/heads/main"));
     }
 }
