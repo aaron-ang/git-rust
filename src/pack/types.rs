@@ -55,7 +55,6 @@ pub(crate) enum PackEntryKind {
 }
 
 pub(crate) struct PackEntry {
-    pub(crate) offset: usize,
     pub(crate) kind: PackEntryKind,
 }
 

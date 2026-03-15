@@ -1,8 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -10,12 +9,8 @@ use sha1::{Digest, Sha1};
 use strum::{Display, EnumString};
 
 use crate::pack::{
-    access::PackIndex,
-    delta::apply_delta_with_interrupt,
-    types::{PackEntry, PackEntryKind, PackObjectLocation},
+    access::PackObjectReader,
 };
-
-type OffsetCache = HashMap<(PathBuf, u64), PackedObject>;
 
 pub const GIT_DIR: &str = ".git";
 pub const GIT_OBJECTS_DIR: &str = "objects";
@@ -32,19 +27,9 @@ pub enum ObjectType {
     Commit,
 }
 
-#[derive(Clone)]
-struct PackedObject {
-    hash: String,
-    object_type: ObjectType,
-    body: Vec<u8>,
-}
-
 pub struct ObjectStore {
     git_dir: PathBuf,
-    pack_indices: RefCell<Option<Vec<PackIndex>>>,
-    pack_data: RefCell<HashMap<PathBuf, Vec<u8>>>,
-    object_cache: RefCell<HashMap<String, (ObjectType, Vec<u8>)>>,
-    offset_cache: RefCell<OffsetCache>,
+    pack_reader: RefCell<PackObjectReader>,
 }
 
 impl Default for ObjectStore {
@@ -56,11 +41,8 @@ impl Default for ObjectStore {
 impl ObjectStore {
     pub fn new(git_dir: PathBuf) -> Self {
         Self {
+            pack_reader: RefCell::new(PackObjectReader::new(git_dir.clone())),
             git_dir,
-            pack_indices: RefCell::new(None),
-            pack_data: RefCell::new(HashMap::new()),
-            object_cache: RefCell::new(HashMap::new()),
-            offset_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -136,112 +118,7 @@ impl ObjectStore {
     }
 
     fn read_packed_object_body(&self, hash: &str) -> Result<(ObjectType, Vec<u8>)> {
-        if let Some(cached) = self.object_cache.borrow().get(hash).cloned() {
-            return Ok(cached);
-        }
-
-        let hash_bytes = Self::hash_hex_to_bytes(hash)?;
-        let hash_bytes: [u8; 20] = hash_bytes.try_into().unwrap();
-        let location = self
-            .find_packed_object(&hash_bytes)?
-            .ok_or_else(|| anyhow!("object not found: {hash}"))?;
-        let object = self.resolve_packed_object_at(&location.pack_path, location.offset)?;
-        self.object_cache
-            .borrow_mut()
-            .insert(hash.to_string(), (object.object_type, object.body.clone()));
-        Ok((object.object_type, object.body))
-    }
-
-    fn find_packed_object(&self, hash: &[u8; 20]) -> Result<Option<PackObjectLocation>> {
-        self.ensure_pack_indices_loaded()?;
-        let pack_indices = self.pack_indices.borrow();
-        let indices = pack_indices.as_ref().unwrap();
-        for index in indices {
-            if let Some(location) = index.find(hash) {
-                return Ok(Some(location));
-            }
-        }
-        Ok(None)
-    }
-
-    fn ensure_pack_indices_loaded(&self) -> Result<()> {
-        if self.pack_indices.borrow().is_some() {
-            return Ok(());
-        }
-
-        let pack_dir = self.pack_dir();
-        let mut indices = Vec::new();
-        if pack_dir.is_dir() {
-            for entry in fs::read_dir(pack_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
-                    indices.push(PackIndex::read(path)?);
-                }
-            }
-        }
-        *self.pack_indices.borrow_mut() = Some(indices);
-        Ok(())
-    }
-
-    fn resolve_packed_object_at(&self, pack_path: &Path, offset: u64) -> Result<PackedObject> {
-        let cache_key = (pack_path.to_path_buf(), offset);
-        if let Some(object) = self.offset_cache.borrow().get(&cache_key).cloned() {
-            return Ok(object);
-        }
-
-        let data = self.read_pack_data(pack_path)?;
-        let entry = PackEntry::from_packed_object_at(&data, offset as usize)?;
-        let object = match entry.kind {
-            PackEntryKind::Base { object_type, body } => PackedObject {
-                hash: Self::object_hash(object_type, &body),
-                object_type,
-                body,
-            },
-            PackEntryKind::OfsDelta { base_offset, delta } => {
-                let PackedObject {
-                    object_type,
-                    body: base_body,
-                    ..
-                } = self.resolve_packed_object_at(pack_path, base_offset as u64)?;
-                let body = apply_delta_with_interrupt(&base_body, &delta, || Ok(()))?;
-                PackedObject {
-                    hash: Self::object_hash(object_type, &body),
-                    object_type,
-                    body,
-                }
-            }
-            PackEntryKind::RefDelta { base_hash, delta } => {
-                let (object_type, base_body) = self.read_object_body(&base_hash)?;
-                let body = apply_delta_with_interrupt(&base_body, &delta, || Ok(()))?;
-                PackedObject {
-                    hash: Self::object_hash(object_type, &body),
-                    object_type,
-                    body,
-                }
-            }
-        };
-
-        self.offset_cache
-            .borrow_mut()
-            .insert(cache_key, object.clone());
-        self.object_cache.borrow_mut().insert(
-            object.hash.clone(),
-            (object.object_type, object.body.clone()),
-        );
-        Ok(object)
-    }
-
-    fn read_pack_data(&self, pack_path: &Path) -> Result<Vec<u8>> {
-        if let Some(data) = self.pack_data.borrow().get(pack_path).cloned() {
-            return Ok(data);
-        }
-
-        let data = fs::read(pack_path)?;
-        self.pack_data
-            .borrow_mut()
-            .insert(pack_path.to_path_buf(), data.clone());
-        Ok(data)
+        self.pack_reader.borrow_mut().read_object_body(hash)
     }
 
     fn write_payload(&self, hash: &str, payload: &[u8]) -> Result<()> {
@@ -259,7 +136,7 @@ impl ObjectStore {
         Ok(())
     }
 
-    fn parse_object_body(payload: &[u8]) -> Result<(ObjectType, Vec<u8>)> {
+    pub(crate) fn parse_object_body(payload: &[u8]) -> Result<(ObjectType, Vec<u8>)> {
         let null_pos = payload
             .iter()
             .position(|&b| b == 0)

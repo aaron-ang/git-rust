@@ -1,12 +1,18 @@
+use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use flate2::{Decompress, FlushDecompress, Status};
+use flate2::read::ZlibDecoder;
 
-use crate::data::object::{ObjectStore, ObjectType};
+use crate::data::object::{GIT_OBJECTS_DIR, GIT_PACK_DIR, ObjectStore, ObjectType};
 
 use super::types::{IndexedObject, PackEntry, PackEntryKind, PackObjectLocation};
+
+type OffsetCache = HashMap<(PathBuf, u64), PackedObject>;
 
 pub(crate) struct PackIndex {
     pack_path: PathBuf,
@@ -98,6 +104,166 @@ impl PackIndex {
     }
 }
 
+#[derive(Clone)]
+struct PackedObject {
+    hash: String,
+    object_type: ObjectType,
+    body: Vec<u8>,
+}
+
+pub(crate) struct PackObjectReader {
+    git_dir: PathBuf,
+    pack_indices: Option<Vec<PackIndex>>,
+    pack_data: HashMap<PathBuf, Vec<u8>>,
+    object_cache: HashMap<String, (ObjectType, Vec<u8>)>,
+    offset_cache: OffsetCache,
+}
+
+impl PackObjectReader {
+    pub(crate) fn new(git_dir: PathBuf) -> Self {
+        Self {
+            git_dir,
+            pack_indices: None,
+            pack_data: HashMap::new(),
+            object_cache: HashMap::new(),
+            offset_cache: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn read_object_body(&mut self, hash: &str) -> Result<(ObjectType, Vec<u8>)> {
+        if let Some(cached) = self.object_cache.get(hash).cloned() {
+            return Ok(cached);
+        }
+
+        let hash_bytes = ObjectStore::hash_hex_to_bytes(hash)?;
+        let hash_bytes: [u8; 20] = hash_bytes.try_into().unwrap();
+        if let Some(location) = self.find_packed_object(&hash_bytes)? {
+            let object = self.resolve_packed_object_at(&location.pack_path, location.offset)?;
+            self.object_cache
+                .insert(hash.to_string(), (object.object_type, object.body.clone()));
+            return Ok((object.object_type, object.body));
+        }
+
+        if let Some(object) = self.read_loose_object_body(hash)? {
+            self.object_cache.insert(hash.to_string(), object.clone());
+            return Ok(object);
+        }
+
+        bail!("object not found: {hash}")
+    }
+
+    fn pack_dir(&self) -> PathBuf {
+        self.git_dir.join(GIT_OBJECTS_DIR).join(GIT_PACK_DIR)
+    }
+
+    fn read_loose_object_body(&self, hash: &str) -> Result<Option<(ObjectType, Vec<u8>)>> {
+        let path = self.object_path(hash)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let compressed = fs::read(path)?;
+        let mut decoder = ZlibDecoder::new(compressed.as_slice());
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        Ok(Some(ObjectStore::parse_object_body(&decompressed)?))
+    }
+
+    fn object_path(&self, hash: &str) -> Result<PathBuf> {
+        if hash.len() != 40 {
+            bail!("object hash must be 40 characters, got {}", hash.len());
+        }
+        let prefix = &hash[..2];
+        let suffix = &hash[2..];
+        Ok(self.git_dir.join(GIT_OBJECTS_DIR).join(prefix).join(suffix))
+    }
+
+    fn find_packed_object(&mut self, hash: &[u8; 20]) -> Result<Option<PackObjectLocation>> {
+        self.ensure_pack_indices_loaded()?;
+        let indices = self.pack_indices.as_ref().unwrap();
+        for index in indices {
+            if let Some(location) = index.find(hash) {
+                return Ok(Some(location));
+            }
+        }
+        Ok(None)
+    }
+
+    fn ensure_pack_indices_loaded(&mut self) -> Result<()> {
+        if self.pack_indices.is_some() {
+            return Ok(());
+        }
+
+        let pack_dir = self.pack_dir();
+        let mut indices = Vec::new();
+        if pack_dir.is_dir() {
+            for entry in fs::read_dir(pack_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("idx") {
+                    indices.push(PackIndex::read(path)?);
+                }
+            }
+        }
+        self.pack_indices = Some(indices);
+        Ok(())
+    }
+
+    fn resolve_packed_object_at(&mut self, pack_path: &Path, offset: u64) -> Result<PackedObject> {
+        let cache_key = (pack_path.to_path_buf(), offset);
+        if let Some(object) = self.offset_cache.get(&cache_key).cloned() {
+            return Ok(object);
+        }
+
+        let data = self.read_pack_data(pack_path)?;
+        let entry = PackEntry::from_packed_object_at(&data, offset as usize)?;
+        let object = match entry.kind {
+            PackEntryKind::Base { object_type, body } => PackedObject {
+                hash: ObjectStore::object_hash(object_type, &body),
+                object_type,
+                body,
+            },
+            PackEntryKind::OfsDelta { base_offset, delta } => {
+                let PackedObject {
+                    object_type,
+                    body: base_body,
+                    ..
+                } = self.resolve_packed_object_at(pack_path, base_offset as u64)?;
+                let body = super::delta::apply_delta_with_interrupt(&base_body, &delta, || Ok(()))?;
+                PackedObject {
+                    hash: ObjectStore::object_hash(object_type, &body),
+                    object_type,
+                    body,
+                }
+            }
+            PackEntryKind::RefDelta { base_hash, delta } => {
+                let (object_type, base_body) = self.read_object_body(&base_hash)?;
+                let body = super::delta::apply_delta_with_interrupt(&base_body, &delta, || Ok(()))?;
+                PackedObject {
+                    hash: ObjectStore::object_hash(object_type, &body),
+                    object_type,
+                    body,
+                }
+            }
+        };
+
+        self.offset_cache.insert(cache_key, object.clone());
+        self.object_cache
+            .insert(object.hash.clone(), (object.object_type, object.body.clone()));
+        Ok(object)
+    }
+
+    fn read_pack_data(&mut self, pack_path: &Path) -> Result<Vec<u8>> {
+        if let Some(data) = self.pack_data.get(pack_path).cloned() {
+            return Ok(data);
+        }
+
+        let data = fs::read(pack_path)?;
+        self.pack_data.insert(pack_path.to_path_buf(), data.clone());
+        Ok(data)
+    }
+}
+
 impl PackEntry {
     pub(crate) fn from_packed_object_at(data: &[u8], offset: usize) -> Result<PackEntry> {
         let (type_id, header_len) = Self::parse_object_header(&data[offset..])?;
@@ -111,7 +277,6 @@ impl PackEntry {
                 };
                 let body = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
-                    offset,
                     kind: PackEntryKind::Base { object_type, body },
                 })
             }
@@ -120,7 +285,6 @@ impl PackEntry {
                 cursor += used;
                 let delta = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
-                    offset,
                     kind: PackEntryKind::OfsDelta {
                         base_offset: offset
                             .checked_sub(distance)
@@ -137,7 +301,6 @@ impl PackEntry {
                 cursor += 20;
                 let delta = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
-                    offset,
                     kind: PackEntryKind::RefDelta { base_hash, delta },
                 })
             }
