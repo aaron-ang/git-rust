@@ -4,7 +4,8 @@ use reqwest::Url;
 use reqwest::blocking::Client;
 
 use super::sideband::{extract_packfile_from_response, pkt_line, stream_packfile_response};
-use crate::pack::PackStream;
+use crate::pack::stream::PackStream;
+use crate::pack::types::ParsedPack;
 
 pub(super) fn fetch_packfile<Pr, PB>(
     client: &Client,
@@ -13,7 +14,7 @@ pub(super) fn fetch_packfile<Pr, PB>(
     capabilities: &[String],
     mut on_progress: Pr,
     mut on_pack_bytes: PB,
-) -> Result<crate::pack::ParsedPack>
+) -> Result<ParsedPack>
 where
     Pr: FnMut(&str) -> Result<()>,
     PB: FnMut(usize, Option<usize>, usize) -> Result<()>,
@@ -68,16 +69,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::pack::parse::pack_object_count;
+
     #[test]
     fn test_pack_object_count_from_header() {
         let pack = b"PACK\x00\x00\x00\x02\x00\x00\x00\xf5rest";
-        assert_eq!(crate::pack::pack_object_count(pack), Some(245));
+        assert_eq!(pack_object_count(pack), Some(245));
+        assert_eq!(pack_object_count(b"PACK\x00\x00\x00\x02"), None);
         assert_eq!(
-            crate::pack::pack_object_count(b"PACK\x00\x00\x00\x02"),
-            None
-        );
-        assert_eq!(
-            crate::pack::pack_object_count(b"NOPE\x00\x00\x00\x02\x00\x00\x00\xf5"),
+            pack_object_count(b"NOPE\x00\x00\x00\x02\x00\x00\x00\xf5"),
             None
         );
     }

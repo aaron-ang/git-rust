@@ -3,7 +3,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io::{self, Read};
 use std::str;
 
-use crate::pack::PackStream;
+use crate::pack::stream::PackStream;
+use crate::pack::types::ParsedPack;
 
 pub(super) enum PacketLine {
     Flush,
@@ -38,7 +39,7 @@ pub(super) fn stream_packfile_response<R, Pr, PB>(
     reader: &mut R,
     on_progress: &mut Pr,
     on_pack_bytes: &mut PB,
-) -> Result<crate::pack::ParsedPack>
+) -> Result<ParsedPack>
 where
     R: Read,
     Pr: FnMut(&str) -> Result<()>,

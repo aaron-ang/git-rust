@@ -80,7 +80,11 @@ impl<'a> Packfile<'a> {
             other => bail!("unsupported pack object type: {}", other),
         };
 
-        Ok(PackEntry { offset, kind })
+        Ok(PackEntry {
+            offset,
+            end_offset: self.offset(),
+            kind,
+        })
     }
 
     fn read_object_header(&self) -> Result<(u8, usize)> {

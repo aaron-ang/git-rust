@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::{
-    clone::run_clone,
+    clone::Clone,
     commit::Commit,
     data::blob::Blob,
     data::object::{GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
@@ -73,7 +73,7 @@ pub fn run() -> GitResult<()> {
         Commands::Clone {
             repo_url,
             target_dir,
-        } => run_clone(&repo_url, target_dir)?,
+        } => Clone::run(&repo_url, target_dir)?,
         Commands::WriteTree => run_write_tree()?,
     }
 

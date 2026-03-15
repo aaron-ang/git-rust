@@ -19,6 +19,7 @@ pub struct PackTransferProgress {
 }
 
 pub struct ParsedPack {
+    pub(crate) data: Vec<u8>,
     pub(crate) entries: Vec<PackEntry>,
     pub(crate) pack_bytes: usize,
 }
@@ -40,11 +41,24 @@ pub(crate) enum PackEntryKind {
 
 pub(crate) struct PackEntry {
     pub(crate) offset: usize,
+    pub(crate) end_offset: usize,
     pub(crate) kind: PackEntryKind,
 }
 
 #[derive(Clone)]
 pub(crate) struct ResolvedObject {
+    pub(crate) hash: String,
     pub(crate) object_type: ObjectType,
     pub(crate) body: Vec<u8>,
+}
+
+pub(crate) struct IndexedObject {
+    pub(crate) hash: [u8; 20],
+    pub(crate) offset: u64,
+    pub(crate) crc32: u32,
+}
+
+pub(crate) struct PackObjectLocation {
+    pub(crate) pack_path: std::path::PathBuf,
+    pub(crate) offset: u64,
 }

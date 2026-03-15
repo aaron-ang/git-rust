@@ -134,8 +134,9 @@ fn resolve_entry(
     let object = match &entries[index].kind {
         PackEntryKind::Base { object_type, body } => {
             check_interrupt()?;
-            let _hash = store.write_object(*object_type, body)?;
+            let hash = store.write_object(*object_type, body)?;
             ResolvedObject {
+                hash,
                 object_type: *object_type,
                 body: body.clone(),
             }
@@ -155,8 +156,9 @@ fn resolve_entry(
             )?;
             let body = apply_delta_with_interrupt(&base.body, delta, &mut *check_interrupt)?;
             check_interrupt()?;
-            let _hash = store.write_object(base.object_type, &body)?;
+            let hash = store.write_object(base.object_type, &body)?;
             ResolvedObject {
+                hash,
                 object_type: base.object_type,
                 body,
             }
@@ -175,13 +177,18 @@ fn resolve_entry(
             } else {
                 check_interrupt()?;
                 let (object_type, body) = store.read_object_body(base_hash)?;
-                ResolvedObject { object_type, body }
+                ResolvedObject {
+                    hash: base_hash.clone(),
+                    object_type,
+                    body,
+                }
             };
 
             let body = apply_delta_with_interrupt(&base.body, delta, &mut *check_interrupt)?;
             check_interrupt()?;
-            let _hash = store.write_object(base.object_type, &body)?;
+            let hash = store.write_object(base.object_type, &body)?;
             ResolvedObject {
+                hash,
                 object_type: base.object_type,
                 body,
             }

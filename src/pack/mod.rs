@@ -1,10 +1,7 @@
-mod delta;
-mod parse;
-mod stream;
-mod types;
-mod unpack;
-
-pub use parse::pack_object_count;
-pub use stream::PackStream;
-pub use types::{PackTransferProgress, ParsedPack, UnpackProgress, UnpackStats};
-pub use unpack::unpack_into;
+pub mod access;
+pub mod delta;
+pub mod index;
+pub mod parse;
+pub mod stream;
+pub mod types;
+pub mod unpack;

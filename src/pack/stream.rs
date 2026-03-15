@@ -79,9 +79,11 @@ impl PackStream {
             bail!("incomplete pack stream, object truncated");
         }
 
+        let pack_bytes = self.data.len();
         Ok(ParsedPack {
+            data: self.data,
             entries: self.entries,
-            pack_bytes: self.data.len(),
+            pack_bytes,
         })
     }
 
@@ -190,6 +192,7 @@ impl StreamingEntry {
     }
 
     fn finish(self) -> PackEntry {
+        let end_offset = self.offset_after();
         let kind = match self.kind {
             StreamingEntryKind::Base(object_type) => PackEntryKind::Base {
                 object_type,
@@ -207,6 +210,7 @@ impl StreamingEntry {
 
         PackEntry {
             offset: self.offset,
+            end_offset,
             kind,
         }
     }

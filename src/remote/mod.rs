@@ -6,6 +6,8 @@ use anyhow::Result;
 use reqwest::Url;
 use reqwest::blocking::Client;
 
+use crate::pack::types::ParsedPack;
+
 #[derive(Clone, Debug)]
 pub struct RemoteRef {
     pub name: String,
@@ -42,7 +44,7 @@ impl RemoteClient {
         capabilities: &[String],
         on_progress: Pr,
         on_pack_bytes: PB,
-    ) -> Result<crate::pack::ParsedPack>
+    ) -> Result<ParsedPack>
     where
         Pr: FnMut(&str) -> Result<()>,
         PB: FnMut(usize, Option<usize>, usize) -> Result<()>,

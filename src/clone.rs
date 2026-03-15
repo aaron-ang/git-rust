@@ -21,161 +21,259 @@ use crate::{
     data::object::{GIT_DIR, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR, ObjectStore},
     data::tree::Tree,
     error::{GitError, GitResult},
+    pack::index::index_pack,
     remote::RemoteClient,
 };
 
-pub fn run_clone(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<()> {
-    let target_dir = resolve_clone_target(repo_url, target_dir)?;
-    let progress = RefCell::new(ProgressRenderer::default());
-    ensure_empty_clone_target(&target_dir)?;
-    install_clone_signal_handler()?;
-    reset_interrupt_state();
+pub struct Clone {
+    repo_url: String,
+    target_dir: PathBuf,
+}
 
-    let result = {
-        let mut target_dir_guard = CloneTargetDir::new(&target_dir)?;
-        (|| -> GitResult<()> {
-            progress
-                .borrow_mut()
-                .print_line(&format!("Cloning into '{}'...", target_dir.display()));
+impl Clone {
+    pub fn run(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<()> {
+        Self::new(repo_url, target_dir)?.execute()
+    }
 
-            let git_dir = init_repo_layout(target_dir_guard.path())?;
-            let store = ObjectStore::new(git_dir.clone());
+    fn new(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<Self> {
+        let repo_url = repo_url.to_string();
+        let target_dir = match target_dir {
+            Some(target_dir) => target_dir,
+            None => {
+                let repo_name = repo_url
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+                    .filter(|segment| !segment.is_empty())
+                    .ok_or(GitError::CantGuessCloneTarget)?;
+                PathBuf::from(repo_name)
+            }
+        };
 
-            let remote = RemoteClient::new(repo_url)?;
-            let discovery = remote.discover()?;
-            check_for_interrupt()?;
-            progress.borrow_mut().start_receiving();
-            let fetch_started = Instant::now();
-            set_disconnect_message_active(true);
-            let parsed_pack = remote.fetch_packfile(
-                &discovery.head_hash,
-                &discovery.capabilities,
-                |msg| {
-                    check_for_interrupt()?;
-                    progress.borrow_mut().remote_chunk(msg);
-                    Ok(())
-                },
-                |pack_bytes, total_objects, received_objects| {
-                    check_for_interrupt()?;
-                    set_disconnect_message_active(false);
-                    progress.borrow_mut().update_pack_progress(
-                        pack_bytes,
-                        total_objects,
-                        received_objects,
-                    );
-                    Ok(())
-                },
-            );
-            set_disconnect_message_active(false);
-            let parsed_pack = parsed_pack?;
-            check_for_interrupt()?;
-            let fetch_elapsed = fetch_started.elapsed();
-            progress.borrow_mut().finish_remote_output();
-            progress.borrow_mut().finish_receiving(fetch_elapsed);
+        Ok(Self {
+            repo_url,
+            target_dir,
+        })
+    }
 
-            let unpack_started = Instant::now();
-            let stats = parsed_pack.unpack_into(
-                &store,
-                |progress_update| {
-                    check_for_interrupt()?;
-                    progress.borrow_mut().resolving_update(
-                        progress_update.resolved_deltas,
-                        progress_update.total_deltas,
-                    );
-                    Ok(())
-                },
-                check_for_interrupt,
-            )?;
-            let unpack_elapsed = unpack_started.elapsed();
+    fn execute(&self) -> GitResult<()> {
+        let progress = RefCell::new(ProgressRenderer::default());
+        self.ensure_empty_target()?;
+        Self::install_signal_handler()?;
+        Self::reset_interrupt_state();
 
-            write_clone_refs(&git_dir, &discovery.head_ref, &discovery.head_hash)?;
+        let result = {
+            let mut target_dir_guard = CloneTargetDir::new(&self.target_dir)?;
+            (|| -> GitResult<()> {
+                progress
+                    .borrow_mut()
+                    .print_line(&format!("Cloning into '{}'...", self.target_dir.display()));
 
-            let root_tree = Commit::root_tree_in(&store, &discovery.head_hash)?;
-            check_for_interrupt()?;
-            progress
-                .borrow_mut()
-                .finish_resolving(stats.deltas, unpack_elapsed);
+                let git_dir = Self::init_repo_layout(target_dir_guard.path())?;
+                let store = ObjectStore::new(git_dir.clone());
 
-            let total_files = Tree::count_checkout_items_in(&store, &root_tree)?;
-            check_for_interrupt()?;
-            Tree::checkout_in_with_progress(
-                &store,
-                &root_tree,
-                target_dir_guard.path(),
-                &mut |updated_files| {
-                    check_for_interrupt()?;
-                    progress
-                        .borrow_mut()
-                        .updating_files_update(updated_files, total_files);
-                    Ok(())
-                },
-            )?;
-            progress.borrow_mut().finish_updating_files(total_files);
-            target_dir_guard.finish();
+                let remote = RemoteClient::new(&self.repo_url)?;
+                let discovery = remote.discover()?;
+                Self::check_for_interrupt()?;
+                progress.borrow_mut().start_receiving();
+                let fetch_started = Instant::now();
+                Self::set_disconnect_message_active(true);
+                let parsed_pack = remote.fetch_packfile(
+                    &discovery.head_hash,
+                    &discovery.capabilities,
+                    |msg| {
+                        Self::check_for_interrupt()?;
+                        progress.borrow_mut().remote_chunk(msg);
+                        Ok(())
+                    },
+                    |pack_bytes, total_objects, received_objects| {
+                        Self::check_for_interrupt()?;
+                        Self::set_disconnect_message_active(false);
+                        progress.borrow_mut().update_pack_progress(
+                            pack_bytes,
+                            total_objects,
+                            received_objects,
+                        );
+                        Ok(())
+                    },
+                );
+                Self::set_disconnect_message_active(false);
+                let parsed_pack = parsed_pack?;
+                Self::check_for_interrupt()?;
+                let fetch_elapsed = fetch_started.elapsed();
+                progress.borrow_mut().finish_remote_output();
+                progress.borrow_mut().finish_receiving(fetch_elapsed);
 
-            Ok(())
-        })()
-    };
+                let unpack_started = Instant::now();
+                let stats = index_pack(
+                    &store,
+                    &parsed_pack,
+                    |progress_update| {
+                        Self::check_for_interrupt()?;
+                        progress.borrow_mut().resolving_update(
+                            progress_update.resolved_deltas,
+                            progress_update.total_deltas,
+                        );
+                        Ok(())
+                    },
+                    || Self::check_for_interrupt(),
+                )?;
+                let unpack_elapsed = unpack_started.elapsed();
 
-    if let Some(interrupt) = take_pending_interrupt() {
-        if interrupt.emit_disconnect_message {
-            eprintln!("fetch-pack: unexpected disconnect while reading sideband packets");
+                Self::write_refs(&git_dir, &discovery.head_ref, &discovery.head_hash)?;
+
+                let root_tree = Commit::root_tree_in(&store, &discovery.head_hash)?;
+                Self::check_for_interrupt()?;
+                progress
+                    .borrow_mut()
+                    .finish_resolving(stats.deltas, unpack_elapsed);
+
+                let total_files = Tree::count_checkout_items_in(&store, &root_tree)?;
+                Self::check_for_interrupt()?;
+                Tree::checkout_in_with_progress(
+                    &store,
+                    &root_tree,
+                    target_dir_guard.path(),
+                    &mut |updated_files| {
+                        Self::check_for_interrupt()?;
+                        progress
+                            .borrow_mut()
+                            .updating_files_update(updated_files, total_files);
+                        Ok(())
+                    },
+                )?;
+                progress.borrow_mut().finish_updating_files(total_files);
+                target_dir_guard.finish();
+
+                Ok(())
+            })()
+        };
+
+        if let Some(interrupt) = Self::take_pending_interrupt() {
+            if interrupt.emit_disconnect_message {
+                eprintln!("fetch-pack: unexpected disconnect while reading sideband packets");
+            }
+            process::exit(128 + interrupt.signal);
         }
-        process::exit(128 + interrupt.signal);
+
+        Self::reset_interrupt_state();
+        result
     }
 
-    reset_interrupt_state();
-    result
-}
+    fn ensure_empty_target(&self) -> GitResult<()> {
+        if !self.target_dir.exists() {
+            return Ok(());
+        }
 
-fn resolve_clone_target(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<PathBuf> {
-    if let Some(target_dir) = target_dir {
-        return Ok(target_dir);
+        let metadata = fs::metadata(&self.target_dir)?;
+        if !metadata.is_dir() {
+            return Err(GitError::CloneTargetNotEmpty(self.target_dir.clone()));
+        }
+
+        if fs::read_dir(&self.target_dir)?.next().is_some() {
+            return Err(GitError::CloneTargetNotEmpty(self.target_dir.clone()));
+        }
+
+        Ok(())
     }
 
-    let repo_name = repo_url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
-        .filter(|segment| !segment.is_empty())
-        .ok_or(GitError::CantGuessCloneTarget)?;
-
-    Ok(PathBuf::from(repo_name))
-}
-
-fn ensure_empty_clone_target(target_dir: &Path) -> GitResult<()> {
-    if !target_dir.exists() {
-        return Ok(());
+    fn init_repo_layout(target_dir: &Path) -> GitResult<PathBuf> {
+        let git_dir = target_dir.join(GIT_DIR);
+        fs::create_dir_all(git_dir.join(GIT_OBJECTS_DIR))?;
+        fs::create_dir_all(git_dir.join(GIT_REFS_DIR))?;
+        Ok(git_dir)
     }
 
-    let metadata = fs::metadata(target_dir)?;
-    if !metadata.is_dir() {
-        return Err(GitError::CloneTargetNotEmpty(target_dir.to_path_buf()));
+    fn write_refs(git_dir: &Path, head_ref: &str, head_hash: &str) -> GitResult<()> {
+        fs::write(git_dir.join(GIT_HEAD_FILE), format!("ref: {head_ref}\n"))?;
+        let ref_path = git_dir.join(head_ref);
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(ref_path, format!("{head_hash}\n"))?;
+        Ok(())
     }
 
-    if fs::read_dir(target_dir)?.next().is_some() {
-        return Err(GitError::CloneTargetNotEmpty(target_dir.to_path_buf()));
+    fn install_signal_handler() -> GitResult<()> {
+        static HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
+        if HANDLER_INSTALLED.get().is_some() {
+            return Ok(());
+        }
+
+        let mut signals = Signals::new(Self::signal_cleanup_signals())?;
+        thread::spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                let state = Clone::signal_state();
+                if state
+                    .interrupted
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    state.signal.store(signal, Ordering::SeqCst);
+                    state.emit_disconnect_message.store(
+                        state.disconnect_message_active.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        });
+
+        let _ = HANDLER_INSTALLED.set(());
+        Ok(())
     }
 
-    Ok(())
-}
-
-fn init_repo_layout(target_dir: &Path) -> GitResult<PathBuf> {
-    let git_dir = target_dir.join(GIT_DIR);
-    fs::create_dir_all(git_dir.join(GIT_OBJECTS_DIR))?;
-    fs::create_dir_all(git_dir.join(GIT_REFS_DIR))?;
-    Ok(git_dir)
-}
-
-fn write_clone_refs(git_dir: &Path, head_ref: &str, head_hash: &str) -> GitResult<()> {
-    fs::write(git_dir.join(GIT_HEAD_FILE), format!("ref: {head_ref}\n"))?;
-    let ref_path = git_dir.join(head_ref);
-    if let Some(parent) = ref_path.parent() {
-        fs::create_dir_all(parent)?;
+    #[cfg(windows)]
+    fn signal_cleanup_signals() -> &'static [i32] {
+        &[SIGINT, SIGTERM]
     }
-    fs::write(ref_path, format!("{head_hash}\n"))?;
-    Ok(())
+
+    #[cfg(not(windows))]
+    fn signal_cleanup_signals() -> &'static [i32] {
+        &[SIGHUP, SIGINT, SIGQUIT, SIGTERM]
+    }
+
+    fn signal_state() -> &'static CloneSignalState {
+        static STATE: CloneSignalState = CloneSignalState::new();
+        &STATE
+    }
+
+    fn reset_interrupt_state() {
+        let state = Self::signal_state();
+        state.interrupted.store(false, Ordering::SeqCst);
+        state.signal.store(0, Ordering::SeqCst);
+        state.emit_disconnect_message.store(false, Ordering::SeqCst);
+        state
+            .disconnect_message_active
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn set_disconnect_message_active(active: bool) {
+        Self::signal_state()
+            .disconnect_message_active
+            .store(active, Ordering::SeqCst);
+    }
+
+    fn take_pending_interrupt() -> Option<CloneInterrupt> {
+        let state = Self::signal_state();
+        if state.interrupted.swap(false, Ordering::SeqCst) {
+            return Some(CloneInterrupt {
+                signal: state.signal.swap(0, Ordering::SeqCst),
+                emit_disconnect_message: state
+                    .emit_disconnect_message
+                    .swap(false, Ordering::SeqCst),
+            });
+        }
+        None
+    }
+
+    fn check_for_interrupt() -> Result<()> {
+        if Self::signal_state().interrupted.load(Ordering::SeqCst) {
+            bail!("clone interrupted")
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,84 +300,6 @@ impl CloneSignalState {
     }
 }
 
-fn clone_signal_state() -> &'static CloneSignalState {
-    static STATE: CloneSignalState = CloneSignalState::new();
-    &STATE
-}
-
-fn install_clone_signal_handler() -> GitResult<()> {
-    static HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
-    if HANDLER_INSTALLED.get().is_some() {
-        return Ok(());
-    }
-
-    let mut signals = Signals::new(signal_cleanup_signals())?;
-    thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            let state = clone_signal_state();
-            if state
-                .interrupted
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                state.signal.store(signal, Ordering::SeqCst);
-                state.emit_disconnect_message.store(
-                    state.disconnect_message_active.load(Ordering::SeqCst),
-                    Ordering::SeqCst,
-                );
-            }
-        }
-    });
-
-    let _ = HANDLER_INSTALLED.set(());
-    Ok(())
-}
-
-#[cfg(windows)]
-fn signal_cleanup_signals() -> &'static [i32] {
-    &[SIGINT, SIGTERM]
-}
-
-#[cfg(not(windows))]
-fn signal_cleanup_signals() -> &'static [i32] {
-    &[SIGHUP, SIGINT, SIGQUIT, SIGTERM]
-}
-
-fn reset_interrupt_state() {
-    let state = clone_signal_state();
-    state.interrupted.store(false, Ordering::SeqCst);
-    state.signal.store(0, Ordering::SeqCst);
-    state.emit_disconnect_message.store(false, Ordering::SeqCst);
-    state
-        .disconnect_message_active
-        .store(false, Ordering::SeqCst);
-}
-
-fn set_disconnect_message_active(active: bool) {
-    clone_signal_state()
-        .disconnect_message_active
-        .store(active, Ordering::SeqCst);
-}
-
-fn take_pending_interrupt() -> Option<CloneInterrupt> {
-    let state = clone_signal_state();
-    if state.interrupted.swap(false, Ordering::SeqCst) {
-        return Some(CloneInterrupt {
-            signal: state.signal.swap(0, Ordering::SeqCst),
-            emit_disconnect_message: state.emit_disconnect_message.swap(false, Ordering::SeqCst),
-        });
-    }
-    None
-}
-
-fn check_for_interrupt() -> Result<()> {
-    if clone_signal_state().interrupted.load(Ordering::SeqCst) {
-        bail!("clone interrupted")
-    } else {
-        Ok(())
-    }
-}
-
 struct CloneTargetDir {
     path: PathBuf,
     existed_before: bool,
@@ -288,7 +308,7 @@ struct CloneTargetDir {
 
 impl CloneTargetDir {
     fn new(target_dir: &Path) -> GitResult<Self> {
-        let path = absolute_path(target_dir)?;
+        let path = Self::absolute_path(target_dir)?;
         let existed_before = path.exists();
         if !existed_before {
             fs::create_dir_all(&path)?;
@@ -308,6 +328,27 @@ impl CloneTargetDir {
     fn finish(&mut self) {
         self.active = false;
     }
+
+    fn remove_contents(&self) -> GitResult<()> {
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn absolute_path(path: &Path) -> GitResult<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
+        }
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 impl Drop for CloneTargetDir {
@@ -317,32 +358,11 @@ impl Drop for CloneTargetDir {
         }
 
         if self.existed_before {
-            let _ = remove_dir_contents(&self.path);
+            let _ = self.remove_contents();
         } else {
             let _ = fs::remove_dir_all(&self.path);
         }
     }
-}
-
-fn remove_dir_contents(dir: &Path) -> GitResult<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn absolute_path(path: &Path) -> GitResult<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    Ok(std::env::current_dir()?.join(path))
 }
 
 #[derive(Default)]
@@ -649,7 +669,12 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("README.md"), b"hello").unwrap();
 
-        let error = ensure_empty_clone_target(temp.path()).unwrap_err();
+        let clone = Clone::new(
+            "https://github.com/example/repo.git",
+            Some(temp.path().into()),
+        )
+        .unwrap();
+        let error = clone.ensure_empty_target().unwrap_err();
         assert!(matches!(error, GitError::CloneTargetNotEmpty(_)));
     }
 
@@ -728,17 +753,17 @@ mod tests {
 
     #[test]
     fn clone_signal_state_tracks_disconnect_message_separately() {
-        reset_interrupt_state();
-        set_disconnect_message_active(true);
-        let state = clone_signal_state();
+        Clone::reset_interrupt_state();
+        Clone::set_disconnect_message_active(true);
+        let state = Clone::signal_state();
         assert!(!state.interrupted.load(Ordering::SeqCst));
         assert!(state.disconnect_message_active.load(Ordering::SeqCst));
 
-        set_disconnect_message_active(false);
+        Clone::set_disconnect_message_active(false);
         assert!(!state.interrupted.load(Ordering::SeqCst));
         assert!(!state.disconnect_message_active.load(Ordering::SeqCst));
 
-        reset_interrupt_state();
+        Clone::reset_interrupt_state();
     }
 
     #[test]
@@ -774,9 +799,12 @@ mod tests {
     #[test]
     fn absolute_path_resolves_relative_paths_from_cwd() {
         let cwd = std::env::current_dir().unwrap();
-        assert_eq!(absolute_path(Path::new("repo")).unwrap(), cwd.join("repo"));
+        assert_eq!(
+            CloneTargetDir::absolute_path(Path::new("repo")).unwrap(),
+            cwd.join("repo")
+        );
 
         let absolute = PathBuf::from("/tmp/repo");
-        assert_eq!(absolute_path(&absolute).unwrap(), absolute);
+        assert_eq!(CloneTargetDir::absolute_path(&absolute).unwrap(), absolute);
     }
 }
