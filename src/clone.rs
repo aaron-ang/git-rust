@@ -414,23 +414,21 @@ impl ProgressRenderer {
 
     fn finish_remote_output(&mut self) {
         if !self.remote_buffer.is_empty() {
-            let line = std::mem::take(&mut self.remote_buffer);
-            let line = if line.starts_with("remote:") {
-                line
-            } else {
-                format!("remote: {line}")
-            };
+            let mut line = std::mem::take(&mut self.remote_buffer);
+            if !line.starts_with("remote:") {
+                line = format!("remote: {line}");
+            }
             self.update_total_objects(&line);
             self.print_line(&line);
+        }
+
+        if self.active_line || !self.remote_buffer.is_empty() {
             self.maybe_render_receiving_status();
-        } else if self.active_line {
-            eprintln!();
-            self.active_line = false;
         }
     }
 
     fn receiving_update(&mut self, received_objects: usize, total_objects: usize) {
-        let object_percent = percent(received_objects, total_objects);
+        let object_percent = Self::percent(received_objects, total_objects);
         self.last_received_objects = received_objects;
         if self.last_received_percent == Some(object_percent) {
             return;
@@ -478,7 +476,7 @@ impl ProgressRenderer {
         }
 
         self.print_status(&self.receiving_status(
-            percent(self.last_received_objects, total_objects),
+            Self::percent(self.last_received_objects, total_objects),
             self.last_received_objects,
             total_objects,
         ));
@@ -490,8 +488,8 @@ impl ProgressRenderer {
         self.print_line(&format!(
             "Receiving objects: 100% ({0}/{0}), {1} | {2}/s, done.",
             total_objects,
-            human_size(bytes),
-            human_size(rate_bytes_per_second(bytes, elapsed))
+            Self::human_size(bytes),
+            Self::human_size(Self::rate_bytes_per_second(bytes, elapsed))
         ));
         self.last_pack_bytes = bytes;
         self.last_received_objects = total_objects;
@@ -506,7 +504,7 @@ impl ProgressRenderer {
         self.print_line(&format!(
             "Resolving deltas: 100% ({0}/{0}), done in {1}.",
             deltas,
-            human_duration(elapsed)
+            Self::human_duration(elapsed)
         ));
     }
 
@@ -515,8 +513,8 @@ impl ProgressRenderer {
             return;
         }
 
-        let delta_percent = percent(resolved_deltas, total_deltas);
-        let stride = progress_update_stride(total_deltas);
+        let delta_percent = Self::percent(resolved_deltas, total_deltas);
+        let stride = Self::progress_update_stride(total_deltas);
         let progressed = resolved_deltas.saturating_sub(self.last_resolved_deltas);
         if self.last_resolved_percent == Some(delta_percent) && progressed < stride {
             return;
@@ -535,8 +533,8 @@ impl ProgressRenderer {
             return;
         }
 
-        let file_percent = percent(updated_files, total_files);
-        let stride = progress_update_stride(total_files);
+        let file_percent = Self::percent(updated_files, total_files);
+        let stride = Self::progress_update_stride(total_files);
         let progressed = updated_files.saturating_sub(self.last_updated_files);
         if self.last_updated_percent == Some(file_percent) && progressed < stride {
             return;
@@ -581,8 +579,8 @@ impl ProgressRenderer {
                 object_percent,
                 received_objects,
                 total_objects,
-                human_size(self.last_pack_bytes),
-                human_size(rate_bytes_per_second(self.last_pack_bytes, elapsed))
+                Self::human_size(self.last_pack_bytes),
+                Self::human_size(Self::rate_bytes_per_second(self.last_pack_bytes, elapsed))
             );
         }
 
@@ -607,49 +605,49 @@ impl ProgressRenderer {
             self.total_objects = Some(count);
         }
     }
-}
 
-fn percent(current: usize, total: usize) -> usize {
-    if total == 0 {
-        return 100;
+    fn percent(current: usize, total: usize) -> usize {
+        if total == 0 {
+            return 100;
+        }
+        (current * 100) / total
     }
-    (current * 100) / total
-}
 
-fn progress_update_stride(total: usize) -> usize {
-    (total / 100).max(1)
-}
-
-fn rate_bytes_per_second(bytes: usize, elapsed: std::time::Duration) -> usize {
-    let seconds = elapsed.as_secs_f64();
-    if seconds == 0.0 {
-        return bytes;
+    fn progress_update_stride(total: usize) -> usize {
+        (total / 100).max(1)
     }
-    (bytes as f64 / seconds).round() as usize
-}
 
-fn human_size(bytes: usize) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-
-    let bytes = bytes as f64;
-    if bytes >= MIB {
-        format!("{:.2} MiB", bytes / MIB)
-    } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes / KIB)
-    } else {
-        format!("{:.0} B", bytes)
+    fn rate_bytes_per_second(bytes: usize, elapsed: std::time::Duration) -> usize {
+        let seconds = elapsed.as_secs_f64();
+        if seconds == 0.0 {
+            return bytes;
+        }
+        (bytes as f64 / seconds).round() as usize
     }
-}
 
-fn human_duration(elapsed: std::time::Duration) -> String {
-    if elapsed.as_millis() == 0 {
-        return "<1ms".to_string();
+    fn human_size(bytes: usize) -> String {
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = 1024.0 * 1024.0;
+
+        let bytes = bytes as f64;
+        if bytes >= MIB {
+            format!("{:.2} MiB", bytes / MIB)
+        } else if bytes >= KIB {
+            format!("{:.2} KiB", bytes / KIB)
+        } else {
+            format!("{:.0} B", bytes)
+        }
     }
-    if elapsed.as_secs() > 0 {
-        format!("{:.2}s", elapsed.as_secs_f64())
-    } else {
-        format!("{}ms", elapsed.as_millis())
+
+    fn human_duration(elapsed: std::time::Duration) -> String {
+        if elapsed.as_millis() == 0 {
+            return "<1ms".to_string();
+        }
+        if elapsed.as_secs() > 0 {
+            format!("{:.2}s", elapsed.as_secs_f64())
+        } else {
+            format!("{}ms", elapsed.as_millis())
+        }
     }
 }
 
@@ -660,9 +658,9 @@ mod tests {
 
     #[test]
     fn human_size_formats_binary_units() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1.00 KiB");
-        assert_eq!(human_size(1024 * 1024), "1.00 MiB");
+        assert_eq!(ProgressRenderer::human_size(512), "512 B");
+        assert_eq!(ProgressRenderer::human_size(1024), "1.00 KiB");
+        assert_eq!(ProgressRenderer::human_size(1024 * 1024), "1.00 MiB");
     }
 
     #[test]
@@ -681,8 +679,8 @@ mod tests {
 
     #[test]
     fn percent_handles_zero_total() {
-        assert_eq!(percent(0, 0), 100);
-        assert_eq!(percent(1, 4), 25);
+        assert_eq!(ProgressRenderer::percent(0, 0), 100);
+        assert_eq!(ProgressRenderer::percent(1, 4), 25);
     }
 
     #[test]
@@ -750,6 +748,21 @@ mod tests {
 
         assert_eq!(renderer.last_received_percent, Some(100));
         assert!(!renderer.active_line);
+    }
+
+    #[test]
+    fn finish_remote_output_preserves_active_receiving_line() {
+        let mut renderer = ProgressRenderer::default();
+
+        renderer.start_receiving();
+        renderer.update_pack_progress(32 * 1024 * 1024, Some(100), 99);
+        assert!(renderer.active_line);
+        assert_eq!(renderer.last_received_percent, Some(99));
+
+        renderer.finish_remote_output();
+
+        assert!(renderer.active_line);
+        assert_eq!(renderer.last_received_percent, Some(99));
     }
 
     #[test]

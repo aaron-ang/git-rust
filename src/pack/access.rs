@@ -100,7 +100,7 @@ impl PackIndex {
 
 impl PackEntry {
     pub(crate) fn from_packed_object_at(data: &[u8], offset: usize) -> Result<PackEntry> {
-        let (type_id, header_len) = parse_object_header(&data[offset..])?;
+        let (type_id, header_len) = Self::parse_object_header(&data[offset..])?;
         let mut cursor = offset + header_len;
         match type_id {
             1..=3 => {
@@ -109,16 +109,16 @@ impl PackEntry {
                     2 => ObjectType::Tree,
                     _ => ObjectType::Blob,
                 };
-                let body = inflate_object(data, cursor)?;
+                let body = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
                     offset,
                     kind: PackEntryKind::Base { object_type, body },
                 })
             }
             6 => {
-                let (distance, used) = parse_ofs_delta_base(&data[cursor..])?;
+                let (distance, used) = Self::parse_ofs_delta_base(&data[cursor..])?;
                 cursor += used;
-                let delta = inflate_object(data, cursor)?;
+                let delta = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
                     offset,
                     kind: PackEntryKind::OfsDelta {
@@ -135,7 +135,7 @@ impl PackEntry {
                         .ok_or_else(|| anyhow!("truncated ref-delta base hash"))?,
                 );
                 cursor += 20;
-                let delta = inflate_object(data, cursor)?;
+                let delta = Self::inflate_object(data, cursor)?;
                 Ok(PackEntry {
                     offset,
                     kind: PackEntryKind::RefDelta { base_hash, delta },
@@ -162,75 +162,78 @@ impl PackEntry {
             PackEntryKind::Base { .. } => bail!("expected delta pack object"),
         }
     }
-}
 
-fn parse_object_header(input: &[u8]) -> Result<(u8, usize)> {
-    let mut consumed = 0usize;
-    let first = *input
-        .get(consumed)
-        .ok_or_else(|| anyhow!("truncated pack object header"))?;
-    let object_type = (first >> 4) & 0x07;
-    let mut byte = first;
-    consumed += 1;
-
-    while byte & 0x80 != 0 {
-        byte = *input
+    fn parse_object_header(input: &[u8]) -> Result<(u8, usize)> {
+        let mut consumed = 0usize;
+        let first = *input
             .get(consumed)
             .ok_or_else(|| anyhow!("truncated pack object header"))?;
+        let object_type = (first >> 4) & 0x07;
+        let mut byte = first;
         consumed += 1;
+
+        while byte & 0x80 != 0 {
+            byte = *input
+                .get(consumed)
+                .ok_or_else(|| anyhow!("truncated pack object header"))?;
+            consumed += 1;
+        }
+
+        Ok((object_type, consumed))
     }
 
-    Ok((object_type, consumed))
-}
-
-fn parse_ofs_delta_base(input: &[u8]) -> Result<(usize, usize)> {
-    let mut consumed = 0usize;
-    let first = *input
-        .get(consumed)
-        .ok_or_else(|| anyhow!("truncated ofs-delta base"))?;
-    let mut byte = first;
-    consumed += 1;
-    let mut offset = (byte & 0x7f) as usize;
-
-    while byte & 0x80 != 0 {
-        byte = *input
+    fn parse_ofs_delta_base(input: &[u8]) -> Result<(usize, usize)> {
+        let mut consumed = 0usize;
+        let first = *input
             .get(consumed)
             .ok_or_else(|| anyhow!("truncated ofs-delta base"))?;
+        let mut byte = first;
         consumed += 1;
-        offset = ((offset + 1) << 7) | (byte & 0x7f) as usize;
+        let mut offset = (byte & 0x7f) as usize;
+
+        while byte & 0x80 != 0 {
+            byte = *input
+                .get(consumed)
+                .ok_or_else(|| anyhow!("truncated ofs-delta base"))?;
+            consumed += 1;
+            offset = ((offset + 1) << 7) | (byte & 0x7f) as usize;
+        }
+
+        Ok((offset, consumed))
     }
 
-    Ok((offset, consumed))
-}
+    fn inflate_object(data: &[u8], start: usize) -> Result<Vec<u8>> {
+        let input = data
+            .get(start..)
+            .ok_or_else(|| anyhow!("pack offset out of bounds"))?;
+        let mut decompressor = Decompress::new(true);
+        let mut output = Vec::new();
+        let mut input_offset = 0usize;
+        let mut buffer = [0u8; 8192];
 
-fn inflate_object(data: &[u8], start: usize) -> Result<Vec<u8>> {
-    let input = data
-        .get(start..)
-        .ok_or_else(|| anyhow!("pack offset out of bounds"))?;
-    let mut decompressor = Decompress::new(true);
-    let mut output = Vec::new();
-    let mut input_offset = 0usize;
-    let mut buffer = [0u8; 8192];
+        loop {
+            let before_in = decompressor.total_in();
+            let before_out = decompressor.total_out();
+            let status = decompressor.decompress(
+                &input[input_offset..],
+                &mut buffer,
+                FlushDecompress::None,
+            )?;
+            let consumed = (decompressor.total_in() - before_in) as usize;
+            let produced = (decompressor.total_out() - before_out) as usize;
+            input_offset += consumed;
+            output.extend_from_slice(&buffer[..produced]);
 
-    loop {
-        let before_in = decompressor.total_in();
-        let before_out = decompressor.total_out();
-        let status =
-            decompressor.decompress(&input[input_offset..], &mut buffer, FlushDecompress::None)?;
-        let consumed = (decompressor.total_in() - before_in) as usize;
-        let produced = (decompressor.total_out() - before_out) as usize;
-        input_offset += consumed;
-        output.extend_from_slice(&buffer[..produced]);
-
-        match status {
-            Status::StreamEnd => break,
-            Status::Ok | Status::BufError => {
-                if consumed == 0 && produced == 0 {
-                    bail!("stalled while inflating pack object");
+            match status {
+                Status::StreamEnd => break,
+                Status::Ok | Status::BufError => {
+                    if consumed == 0 && produced == 0 {
+                        bail!("stalled while inflating pack object");
+                    }
                 }
             }
         }
-    }
 
-    Ok(output)
+        Ok(output)
+    }
 }
