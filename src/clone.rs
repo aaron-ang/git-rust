@@ -3,7 +3,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -123,7 +124,7 @@ pub fn run_clone(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<()> {
         process::exit(128 + interrupt.signal);
     }
 
-    clear_interrupt_state();
+    reset_interrupt_state();
     result
 }
 
@@ -177,25 +178,33 @@ fn write_clone_refs(git_dir: &Path, head_ref: &str, head_hash: &str) -> GitResul
     Ok(())
 }
 
-struct CloneSignalState {
-    pending_interrupt: Option<CloneInterrupt>,
-    disconnect_message_active: bool,
-}
-
 #[derive(Clone, Copy)]
 struct CloneInterrupt {
     signal: i32,
     emit_disconnect_message: bool,
 }
 
-fn clone_signal_state() -> &'static Mutex<CloneSignalState> {
-    static STATE: OnceLock<Mutex<CloneSignalState>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(CloneSignalState {
-            pending_interrupt: None,
-            disconnect_message_active: false,
-        })
-    })
+struct CloneSignalState {
+    interrupted: AtomicBool,
+    signal: AtomicI32,
+    emit_disconnect_message: AtomicBool,
+    disconnect_message_active: AtomicBool,
+}
+
+impl CloneSignalState {
+    const fn new() -> Self {
+        Self {
+            interrupted: AtomicBool::new(false),
+            signal: AtomicI32::new(0),
+            emit_disconnect_message: AtomicBool::new(false),
+            disconnect_message_active: AtomicBool::new(false),
+        }
+    }
+}
+
+fn clone_signal_state() -> &'static CloneSignalState {
+    static STATE: CloneSignalState = CloneSignalState::new();
+    &STATE
 }
 
 fn install_clone_signal_handler() -> GitResult<()> {
@@ -206,14 +215,19 @@ fn install_clone_signal_handler() -> GitResult<()> {
 
     let mut signals = Signals::new(signal_cleanup_signals())?;
     thread::spawn(move || {
-        if let Some(signal) = signals.forever().next()
-            && let Ok(mut state) = clone_signal_state().lock()
-        {
-            let emit_disconnect_message = state.disconnect_message_active;
-            state.pending_interrupt.get_or_insert(CloneInterrupt {
-                signal,
-                emit_disconnect_message,
-            });
+        if let Some(signal) = signals.forever().next() {
+            let state = clone_signal_state();
+            if state
+                .interrupted
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                state.signal.store(signal, Ordering::SeqCst);
+                state.emit_disconnect_message.store(
+                    state.disconnect_message_active.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+            }
         }
     });
 
@@ -232,40 +246,34 @@ fn signal_cleanup_signals() -> &'static [i32] {
 }
 
 fn reset_interrupt_state() {
-    if let Ok(mut state) = clone_signal_state().lock() {
-        state.pending_interrupt = None;
-        state.disconnect_message_active = false;
-    }
+    let state = clone_signal_state();
+    state.interrupted.store(false, Ordering::SeqCst);
+    state.signal.store(0, Ordering::SeqCst);
+    state.emit_disconnect_message.store(false, Ordering::SeqCst);
+    state
+        .disconnect_message_active
+        .store(false, Ordering::SeqCst);
 }
 
 fn set_disconnect_message_active(active: bool) {
-    if let Ok(mut state) = clone_signal_state().lock() {
-        state.disconnect_message_active = active;
-    }
-}
-
-fn clear_interrupt_state() {
-    if let Ok(mut state) = clone_signal_state().lock() {
-        state.pending_interrupt = None;
-        state.disconnect_message_active = false;
-    }
+    clone_signal_state()
+        .disconnect_message_active
+        .store(active, Ordering::SeqCst);
 }
 
 fn take_pending_interrupt() -> Option<CloneInterrupt> {
-    if let Ok(mut state) = clone_signal_state().lock() {
-        return state.pending_interrupt.take();
+    let state = clone_signal_state();
+    if state.interrupted.swap(false, Ordering::SeqCst) {
+        return Some(CloneInterrupt {
+            signal: state.signal.swap(0, Ordering::SeqCst),
+            emit_disconnect_message: state.emit_disconnect_message.swap(false, Ordering::SeqCst),
+        });
     }
     None
 }
 
 fn check_for_interrupt() -> Result<()> {
-    let interrupted = if let Ok(state) = clone_signal_state().lock() {
-        state.pending_interrupt.is_some()
-    } else {
-        false
-    };
-
-    if interrupted {
+    if clone_signal_state().interrupted.load(Ordering::SeqCst) {
         bail!("clone interrupted")
     } else {
         Ok(())
@@ -720,22 +728,17 @@ mod tests {
 
     #[test]
     fn clone_signal_state_tracks_disconnect_message_separately() {
-        clear_interrupt_state();
+        reset_interrupt_state();
         set_disconnect_message_active(true);
-        {
-            let state = clone_signal_state().lock().unwrap();
-            assert!(state.pending_interrupt.is_none());
-            assert!(state.disconnect_message_active);
-        }
+        let state = clone_signal_state();
+        assert!(!state.interrupted.load(Ordering::SeqCst));
+        assert!(state.disconnect_message_active.load(Ordering::SeqCst));
 
         set_disconnect_message_active(false);
-        {
-            let state = clone_signal_state().lock().unwrap();
-            assert!(state.pending_interrupt.is_none());
-            assert!(!state.disconnect_message_active);
-        }
+        assert!(!state.interrupted.load(Ordering::SeqCst));
+        assert!(!state.disconnect_message_active.load(Ordering::SeqCst));
 
-        clear_interrupt_state();
+        reset_interrupt_state();
     }
 
     #[test]
