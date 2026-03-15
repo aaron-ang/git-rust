@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod cli;
+pub mod clone;
 pub mod commit;
 pub mod error;
 pub mod object;

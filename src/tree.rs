@@ -17,6 +17,8 @@ enum TreeEntryMode {
     RegularFile,
     #[strum(serialize = "100755")]
     ExecutableFile,
+    #[strum(serialize = "120000")]
+    SymbolicLink,
     #[strum(serialize = "40000")]
     Directory,
 }
@@ -43,28 +45,92 @@ impl Tree {
         Self::write_dir(&store, &cwd)
     }
 
-    pub fn checkout_in(store: &ObjectStore, tree_sha: &str, root: &Path) -> Result<()> {
+    pub fn checkout_in_with_progress<F>(
+        store: &ObjectStore,
+        tree_sha: &str,
+        root: &Path,
+        on_update: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
+        let mut updated_files = 0;
+        Self::checkout_tree(store, tree_sha, root, &mut updated_files, on_update)
+    }
+
+    pub fn count_checkout_items_in(store: &ObjectStore, tree_sha: &str) -> Result<usize> {
+        let tree = Self::read_from(store, tree_sha)?;
+        let mut count = 0;
+        for entry in tree.iter() {
+            if entry.mode == TreeEntryMode::Directory {
+                count += Self::count_checkout_items_in(store, &entry.hash)?;
+            } else {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn checkout_tree<F>(
+        store: &ObjectStore,
+        tree_sha: &str,
+        root: &Path,
+        updated_files: &mut usize,
+        on_update: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize) -> Result<()>,
+    {
         let tree = Self::read_from(store, tree_sha)?;
         for entry in tree.iter() {
             let path = root.join(&entry.name);
             if entry.mode == TreeEntryMode::Directory {
                 fs::create_dir_all(&path)?;
-                Self::checkout_in(store, &entry.hash, &path)?;
+                Self::checkout_tree(store, &entry.hash, &path, updated_files, on_update)?;
                 continue;
             }
 
-            let blob = Blob::read_from(store, &entry.hash)?;
-            fs::write(&path, blob)?;
-
-            #[cfg(unix)]
-            if entry.mode == TreeEntryMode::ExecutableFile {
-                use std::os::unix::fs::PermissionsExt;
-
-                let mut permissions = fs::metadata(&path)?.permissions();
-                permissions.set_mode(0o755);
-                fs::set_permissions(&path, permissions)?;
-            }
+            Self::checkout_entry(store, entry, &path)?;
+            *updated_files += 1;
+            on_update(*updated_files)?;
         }
+        Ok(())
+    }
+
+    fn checkout_entry(store: &ObjectStore, entry: &TreeEntry, path: &Path) -> Result<()> {
+        let blob = Blob::read_from(store, &entry.hash)?;
+
+        match entry.mode {
+            TreeEntryMode::RegularFile | TreeEntryMode::ExecutableFile => {
+                fs::write(path, blob)?;
+
+                #[cfg(unix)]
+                if entry.mode == TreeEntryMode::ExecutableFile {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    let mut permissions = fs::metadata(path)?.permissions();
+                    permissions.set_mode(0o755);
+                    fs::set_permissions(path, permissions)?;
+                }
+            }
+            TreeEntryMode::SymbolicLink => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::symlink;
+
+                    let target = std::str::from_utf8(blob.as_ref())
+                        .map_err(|_| anyhow!("symbolic link target is not UTF-8"))?;
+                    symlink(target, path)?;
+                }
+
+                #[cfg(not(unix))]
+                {
+                    fs::write(path, blob)?;
+                }
+            }
+            TreeEntryMode::Directory => bail!("directory cannot be checked out as a file"),
+        }
+
         Ok(())
     }
 
@@ -254,6 +320,15 @@ mod tests {
         assert_eq!(tree[1].mode, TreeEntryMode::RegularFile);
         assert_eq!(tree[1].name, "file1");
         assert_eq!(tree[1].hash, HELLO_WORLD_BLOB_HASH);
+    }
+
+    #[test]
+    fn test_parse_tree_symbolic_link_entry() {
+        let data = make_tree_data(&[("120000", "link", SAMPLE_TREE_HASH)]);
+
+        let tree = Tree::parse(&data).unwrap();
+        assert_eq!(tree[0].mode, TreeEntryMode::SymbolicLink);
+        assert_eq!(tree[0].name, "link");
     }
 
     #[test]
