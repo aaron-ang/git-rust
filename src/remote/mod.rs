@@ -1,10 +1,12 @@
-mod discovery;
-mod fetch_pack;
-mod sideband;
+use std::path::Path;
 
 use anyhow::Result;
 use reqwest::Url;
 use reqwest::blocking::Client;
+
+mod discovery;
+mod fetch_pack;
+mod sideband;
 
 use crate::pack::types::ParsedPack;
 
@@ -40,6 +42,7 @@ impl RemoteClient {
 
     pub fn fetch_packfile<Pr, PB>(
         &self,
+        pack_dir: &Path,
         want: &str,
         capabilities: &[String],
         on_progress: Pr,
@@ -52,6 +55,7 @@ impl RemoteClient {
         fetch_pack::fetch_packfile(
             &self.client,
             &self.repo_url,
+            pack_dir,
             want,
             capabilities,
             on_progress,

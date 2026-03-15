@@ -49,7 +49,10 @@ impl PackIndex {
                 u32::from_be_bytes(data[start..start + 4].try_into().unwrap())
             })
             .collect::<Vec<_>>();
-        let large_count = small_offsets.iter().filter(|offset| **offset & 0x8000_0000 != 0).count();
+        let large_count = small_offsets
+            .iter()
+            .filter(|offset| **offset & 0x8000_0000 != 0)
+            .count();
         let large_start = offsets_end;
         let large_end = large_start + large_count * 8;
         if data.len() < large_end + 40 {
@@ -95,52 +98,69 @@ impl PackIndex {
     }
 }
 
-pub(crate) fn read_packed_object_at(data: &[u8], offset: usize) -> Result<PackEntry> {
-    let (type_id, header_len) = parse_object_header(&data[offset..])?;
-    let mut cursor = offset + header_len;
-    match type_id {
-        1..=3 => {
-            let object_type = match type_id {
-                1 => ObjectType::Commit,
-                2 => ObjectType::Tree,
-                _ => ObjectType::Blob,
-            };
-            let (body, compressed_len) = inflate_object(data, cursor)?;
-            Ok(PackEntry {
-                offset,
-                end_offset: cursor + compressed_len,
-                kind: PackEntryKind::Base { object_type, body },
-            })
+impl PackEntry {
+    pub(crate) fn from_packed_object_at(data: &[u8], offset: usize) -> Result<PackEntry> {
+        let (type_id, header_len) = parse_object_header(&data[offset..])?;
+        let mut cursor = offset + header_len;
+        match type_id {
+            1..=3 => {
+                let object_type = match type_id {
+                    1 => ObjectType::Commit,
+                    2 => ObjectType::Tree,
+                    _ => ObjectType::Blob,
+                };
+                let body = inflate_object(data, cursor)?;
+                Ok(PackEntry {
+                    offset,
+                    kind: PackEntryKind::Base { object_type, body },
+                })
+            }
+            6 => {
+                let (distance, used) = parse_ofs_delta_base(&data[cursor..])?;
+                cursor += used;
+                let delta = inflate_object(data, cursor)?;
+                Ok(PackEntry {
+                    offset,
+                    kind: PackEntryKind::OfsDelta {
+                        base_offset: offset
+                            .checked_sub(distance)
+                            .ok_or_else(|| anyhow!("invalid ofs-delta base offset"))?,
+                        delta,
+                    },
+                })
+            }
+            7 => {
+                let base_hash = ObjectStore::hash_bytes_to_hex(
+                    data.get(cursor..cursor + 20)
+                        .ok_or_else(|| anyhow!("truncated ref-delta base hash"))?,
+                );
+                cursor += 20;
+                let delta = inflate_object(data, cursor)?;
+                Ok(PackEntry {
+                    offset,
+                    kind: PackEntryKind::RefDelta { base_hash, delta },
+                })
+            }
+            other => bail!("unsupported pack object type: {}", other),
         }
-        6 => {
-            let (distance, used) = parse_ofs_delta_base(&data[cursor..])?;
-            cursor += used;
-            let (delta, compressed_len) = inflate_object(data, cursor)?;
-            Ok(PackEntry {
-                offset,
-                end_offset: cursor + compressed_len,
-                kind: PackEntryKind::OfsDelta {
-                    base_offset: offset
-                        .checked_sub(distance)
-                        .ok_or_else(|| anyhow!("invalid ofs-delta base offset"))?,
-                    delta,
-                },
-            })
+    }
+
+    pub(crate) fn into_body(self) -> Result<Vec<u8>> {
+        match self.kind {
+            PackEntryKind::Base { body, .. } => Ok(body),
+            PackEntryKind::OfsDelta { .. } | PackEntryKind::RefDelta { .. } => {
+                bail!("expected base pack object")
+            }
         }
-        7 => {
-            let base_hash = ObjectStore::hash_bytes_to_hex(
-                data.get(cursor..cursor + 20)
-                    .ok_or_else(|| anyhow!("truncated ref-delta base hash"))?,
-            );
-            cursor += 20;
-            let (delta, compressed_len) = inflate_object(data, cursor)?;
-            Ok(PackEntry {
-                offset,
-                end_offset: cursor + compressed_len,
-                kind: PackEntryKind::RefDelta { base_hash, delta },
-            })
+    }
+
+    pub(crate) fn into_delta(self) -> Result<Vec<u8>> {
+        match self.kind {
+            PackEntryKind::OfsDelta { delta, .. } | PackEntryKind::RefDelta { delta, .. } => {
+                Ok(delta)
+            }
+            PackEntryKind::Base { .. } => bail!("expected delta pack object"),
         }
-        other => bail!("unsupported pack object type: {}", other),
     }
 }
 
@@ -183,7 +203,7 @@ fn parse_ofs_delta_base(input: &[u8]) -> Result<(usize, usize)> {
     Ok((offset, consumed))
 }
 
-fn inflate_object(data: &[u8], start: usize) -> Result<(Vec<u8>, usize)> {
+fn inflate_object(data: &[u8], start: usize) -> Result<Vec<u8>> {
     let input = data
         .get(start..)
         .ok_or_else(|| anyhow!("pack offset out of bounds"))?;
@@ -195,11 +215,8 @@ fn inflate_object(data: &[u8], start: usize) -> Result<(Vec<u8>, usize)> {
     loop {
         let before_in = decompressor.total_in();
         let before_out = decompressor.total_out();
-        let status = decompressor.decompress(
-            &input[input_offset..],
-            &mut buffer,
-            FlushDecompress::None,
-        )?;
+        let status =
+            decompressor.decompress(&input[input_offset..], &mut buffer, FlushDecompress::None)?;
         let consumed = (decompressor.total_in() - before_in) as usize;
         let produced = (decompressor.total_out() - before_out) as usize;
         input_offset += consumed;
@@ -215,5 +232,5 @@ fn inflate_object(data: &[u8], start: usize) -> Result<(Vec<u8>, usize)> {
         }
     }
 
-    Ok((output, input_offset))
+    Ok(output)
 }

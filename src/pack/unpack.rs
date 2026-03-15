@@ -6,9 +6,7 @@ use crate::data::object::ObjectStore;
 
 use super::delta::apply_delta_with_interrupt;
 use super::parse::Packfile;
-use super::types::{
-    PackEntry, PackEntryKind, ParsedPack, ResolvedObject, UnpackProgress, UnpackStats,
-};
+use super::types::{PackEntry, PackEntryKind, ResolvedObject, UnpackProgress, UnpackStats};
 
 pub fn unpack_into<F, C>(
     store: &ObjectStore,
@@ -22,27 +20,6 @@ where
 {
     let entries = Packfile::new(pack).parse()?;
     unpack_entries(store, &entries, pack.len(), on_progress, check_interrupt)
-}
-
-impl ParsedPack {
-    pub fn unpack_into<F, C>(
-        &self,
-        store: &ObjectStore,
-        on_progress: F,
-        check_interrupt: C,
-    ) -> Result<UnpackStats>
-    where
-        F: FnMut(UnpackProgress) -> Result<()>,
-        C: FnMut() -> Result<()>,
-    {
-        unpack_entries(
-            store,
-            &self.entries,
-            self.pack_bytes,
-            on_progress,
-            check_interrupt,
-        )
-    }
 }
 
 fn unpack_entries<F, C>(

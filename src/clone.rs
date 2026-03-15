@@ -75,20 +75,21 @@ impl Clone {
 
                 let remote = RemoteClient::new(&self.repo_url)?;
                 let discovery = remote.discover()?;
-                Self::check_for_interrupt()?;
+                Self::check_interrupt()?;
                 progress.borrow_mut().start_receiving();
                 let fetch_started = Instant::now();
                 Self::set_disconnect_message_active(true);
                 let parsed_pack = remote.fetch_packfile(
+                    &store.pack_dir(),
                     &discovery.head_hash,
                     &discovery.capabilities,
                     |msg| {
-                        Self::check_for_interrupt()?;
+                        Self::check_interrupt()?;
                         progress.borrow_mut().remote_chunk(msg);
                         Ok(())
                     },
                     |pack_bytes, total_objects, received_objects| {
-                        Self::check_for_interrupt()?;
+                        Self::check_interrupt()?;
                         Self::set_disconnect_message_active(false);
                         progress.borrow_mut().update_pack_progress(
                             pack_bytes,
@@ -100,7 +101,7 @@ impl Clone {
                 );
                 Self::set_disconnect_message_active(false);
                 let parsed_pack = parsed_pack?;
-                Self::check_for_interrupt()?;
+                Self::check_interrupt()?;
                 let fetch_elapsed = fetch_started.elapsed();
                 progress.borrow_mut().finish_remote_output();
                 progress.borrow_mut().finish_receiving(fetch_elapsed);
@@ -110,33 +111,33 @@ impl Clone {
                     &store,
                     &parsed_pack,
                     |progress_update| {
-                        Self::check_for_interrupt()?;
+                        Self::check_interrupt()?;
                         progress.borrow_mut().resolving_update(
                             progress_update.resolved_deltas,
                             progress_update.total_deltas,
                         );
                         Ok(())
                     },
-                    || Self::check_for_interrupt(),
+                    Self::check_interrupt,
                 )?;
                 let unpack_elapsed = unpack_started.elapsed();
 
                 Self::write_refs(&git_dir, &discovery.head_ref, &discovery.head_hash)?;
 
                 let root_tree = Commit::root_tree_in(&store, &discovery.head_hash)?;
-                Self::check_for_interrupt()?;
+                Self::check_interrupt()?;
                 progress
                     .borrow_mut()
                     .finish_resolving(stats.deltas, unpack_elapsed);
 
                 let total_files = Tree::count_checkout_items_in(&store, &root_tree)?;
-                Self::check_for_interrupt()?;
+                Self::check_interrupt()?;
                 Tree::checkout_in_with_progress(
                     &store,
                     &root_tree,
                     target_dir_guard.path(),
                     &mut |updated_files| {
-                        Self::check_for_interrupt()?;
+                        Self::check_interrupt()?;
                         progress
                             .borrow_mut()
                             .updating_files_update(updated_files, total_files);
@@ -267,7 +268,7 @@ impl Clone {
         None
     }
 
-    fn check_for_interrupt() -> Result<()> {
+    fn check_interrupt() -> Result<()> {
         if Self::signal_state().interrupted.load(Ordering::SeqCst) {
             bail!("clone interrupted")
         } else {

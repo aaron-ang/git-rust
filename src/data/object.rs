@@ -10,9 +10,9 @@ use sha1::{Digest, Sha1};
 use strum::{Display, EnumString};
 
 use crate::pack::{
-    access::{PackIndex, read_packed_object_at},
+    access::PackIndex,
     delta::apply_delta_with_interrupt,
-    types::{PackEntryKind, PackObjectLocation},
+    types::{PackEntry, PackEntryKind, PackObjectLocation},
 };
 
 type OffsetCache = HashMap<(PathBuf, u64), PackedObject>;
@@ -62,10 +62,6 @@ impl ObjectStore {
             object_cache: RefCell::new(HashMap::new()),
             offset_cache: RefCell::new(HashMap::new()),
         }
-    }
-
-    pub(crate) fn git_dir(&self) -> &Path {
-        &self.git_dir
     }
 
     pub(crate) fn pack_dir(&self) -> PathBuf {
@@ -195,7 +191,7 @@ impl ObjectStore {
         }
 
         let data = self.read_pack_data(pack_path)?;
-        let entry = read_packed_object_at(&data, offset as usize)?;
+        let entry = PackEntry::from_packed_object_at(&data, offset as usize)?;
         let object = match entry.kind {
             PackEntryKind::Base { object_type, body } => PackedObject {
                 hash: Self::object_hash(object_type, &body),
@@ -354,7 +350,7 @@ mod tests {
         let store = ObjectStore::new(temp.path().join(GIT_DIR));
         let hash = Blob::write_content_in(&store, b"hello world\n").unwrap();
         let loose = store.read_object(&hash).unwrap();
-        let mut stream = PackStream::default();
+        let mut stream = PackStream::new(&store.pack_dir()).unwrap();
         let pack = build_pack_from_payload(&loose);
         stream.append(&pack).unwrap();
         let parsed = stream.finish().unwrap();

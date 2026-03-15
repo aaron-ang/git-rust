@@ -1,7 +1,9 @@
+use std::io::{self, Read};
+use std::path::Path;
+use std::str;
+
 use anyhow::{Result, anyhow, bail};
 use bytes::{Buf, Bytes, BytesMut};
-use std::io::{self, Read};
-use std::str;
 
 use crate::pack::stream::PackStream;
 use crate::pack::types::ParsedPack;
@@ -37,6 +39,7 @@ pub(super) fn extract_packfile_from_response(mut bytes: Bytes) -> Result<Bytes> 
 
 pub(super) fn stream_packfile_response<R, Pr, PB>(
     reader: &mut R,
+    pack_dir: &Path,
     on_progress: &mut Pr,
     on_pack_bytes: &mut PB,
 ) -> Result<ParsedPack>
@@ -52,7 +55,7 @@ where
         None => bail!("upload-pack response too short"),
     }
 
-    let mut pack = PackStream::default();
+    let mut pack = PackStream::new(pack_dir)?;
     while let Some(packet) = read_packet_line(reader)? {
         let PacketLine::Data(payload) = packet else {
             continue;

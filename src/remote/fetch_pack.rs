@@ -1,15 +1,19 @@
+use std::path::Path;
+
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
 use reqwest::Url;
 use reqwest::blocking::Client;
 
-use super::sideband::{extract_packfile_from_response, pkt_line, stream_packfile_response};
 use crate::pack::stream::PackStream;
 use crate::pack::types::ParsedPack;
+
+use super::sideband::{extract_packfile_from_response, pkt_line, stream_packfile_response};
 
 pub(super) fn fetch_packfile<Pr, PB>(
     client: &Client,
     repo_url: &Url,
+    pack_dir: &Path,
     want: &str,
     capabilities: &[String],
     mut on_progress: Pr,
@@ -52,12 +56,17 @@ where
         .iter()
         .any(|cap| matches!(cap.as_str(), "side-band-64k" | "side-band"))
     {
-        return stream_packfile_response(&mut response, &mut on_progress, &mut on_pack_bytes);
+        return stream_packfile_response(
+            &mut response,
+            pack_dir,
+            &mut on_progress,
+            &mut on_pack_bytes,
+        );
     }
 
     let bytes = response.bytes()?;
     let bytes = extract_packfile_from_response(bytes)?;
-    let mut pack = PackStream::default();
+    let mut pack = PackStream::new(pack_dir)?;
     let progress = pack.append(bytes.as_ref())?;
     on_pack_bytes(
         pack.pack_bytes(),

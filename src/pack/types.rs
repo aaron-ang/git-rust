@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::data::object::ObjectType;
 
 pub struct UnpackStats {
@@ -19,9 +21,22 @@ pub struct PackTransferProgress {
 }
 
 pub struct ParsedPack {
-    pub(crate) data: Vec<u8>,
-    pub(crate) entries: Vec<PackEntry>,
+    pub(crate) pack_path: PathBuf,
+    pub(crate) pack_checksum: [u8; 20],
+    pub(crate) entries: Vec<PackEntryInfo>,
     pub(crate) pack_bytes: usize,
+}
+
+pub(crate) enum PackEntryInfoKind {
+    Base { object_type: ObjectType },
+    OfsDelta { base_offset: usize },
+    RefDelta { base_hash: String },
+}
+
+pub(crate) struct PackEntryInfo {
+    pub(crate) offset: usize,
+    pub(crate) end_offset: usize,
+    pub(crate) kind: PackEntryInfoKind,
 }
 
 pub(crate) enum PackEntryKind {
@@ -41,7 +56,6 @@ pub(crate) enum PackEntryKind {
 
 pub(crate) struct PackEntry {
     pub(crate) offset: usize,
-    pub(crate) end_offset: usize,
     pub(crate) kind: PackEntryKind,
 }
 
