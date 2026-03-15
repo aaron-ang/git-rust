@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use derive_more::{AsRef, Deref};
 
-use crate::object::{ObjectStore, ObjectType};
+use super::object::{ObjectStore, ObjectType};
 
 /// Git blob object: file content only (no name or permissions).
 #[derive(Debug, Deref, AsRef)]
@@ -68,7 +68,7 @@ impl<const N: usize> PartialEq<[u8; N]> for Blob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::GIT_DIR;
+    use crate::data::object::GIT_DIR;
 
     use tempfile::tempdir;
 

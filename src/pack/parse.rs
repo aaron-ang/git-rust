@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use bytes::Buf;
 use flate2::{Decompress, FlushDecompress, Status};
 
-use crate::object::{ObjectStore, ObjectType};
+use crate::data::object::{ObjectStore, ObjectType};
 
 use super::types::{PackEntry, PackEntryKind};
 

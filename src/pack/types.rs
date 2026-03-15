@@ -1,4 +1,4 @@
-use crate::object::ObjectType;
+use crate::data::object::ObjectType;
 
 pub struct UnpackStats {
     pub objects: usize,

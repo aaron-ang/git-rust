@@ -17,10 +17,10 @@ use signal_hook::{
 
 use crate::{
     commit::Commit,
+    data::object::{GIT_DIR, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR, ObjectStore},
+    data::tree::Tree,
     error::{GitError, GitResult},
-    object::{GIT_DIR, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR, ObjectStore},
     remote::RemoteClient,
-    tree::Tree,
 };
 
 pub fn run_clone(repo_url: &str, target_dir: Option<PathBuf>) -> GitResult<()> {

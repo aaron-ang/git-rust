@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use derive_more::{Deref, Display};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 
-use crate::{
+use super::{
     blob::Blob,
     object::{GIT_DIR, ObjectStore, ObjectType},
 };
@@ -277,7 +277,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    use crate::object::GIT_OBJECTS_DIR;
+    use crate::data::object::GIT_OBJECTS_DIR;
 
     const SAMPLE_TREE_HASH: &str = "1111111111111111111111111111111111111111";
     const HELLO_WORLD_BLOB_HASH: &str = "95d09f2b10159347eece71399a7e2e907ea3df4f";

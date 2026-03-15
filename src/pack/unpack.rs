@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 
-use crate::object::ObjectStore;
+use crate::data::object::ObjectStore;
 
 use super::delta::apply_delta_with_interrupt;
 use super::parse::Packfile;

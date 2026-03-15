@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use crate::{
-    blob::Blob,
     clone::run_clone,
     commit::Commit,
+    data::blob::Blob,
+    data::object::{GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
+    data::tree::Tree,
     error::{GitError, GitResult},
-    object::{GIT_DIR, GIT_HEAD_CONTENT, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR},
-    tree::Tree,
 };
 
 #[derive(Parser)]

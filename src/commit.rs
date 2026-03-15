@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 
-use crate::object::{ObjectStore, ObjectType};
+use crate::data::object::{ObjectStore, ObjectType};
 
 const AUTHOR_NAME: &str = "John Doe";
 const AUTHOR_EMAIL: &str = "john@example.com";
@@ -68,7 +68,7 @@ impl Commit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::GIT_DIR;
+    use crate::data::object::GIT_DIR;
     use tempfile::tempdir;
 
     const TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";

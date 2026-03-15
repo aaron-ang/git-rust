@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use flate2::{Decompress, FlushDecompress, Status};
 
-use crate::object::{ObjectStore, ObjectType};
+use crate::data::object::{ObjectStore, ObjectType};
 
 use super::parse::{parse_object_header_partial, parse_ofs_delta_base_partial, parse_pack_header};
 use super::types::{PackEntry, PackEntryKind, PackTransferProgress, ParsedPack};
