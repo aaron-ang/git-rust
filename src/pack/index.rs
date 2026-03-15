@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, bail};
 use crc32fast::hash as crc32;
 use sha1::{Digest, Sha1};
 
-use crate::data::object::ObjectStore;
+use crate::data::object::{ObjectStore, ObjectType};
 
 use super::types::{
     IndexedObject, PackEntry, PackEntryInfoKind, ParsedPack, ResolvedObject, UnpackProgress,
@@ -34,7 +34,8 @@ where
     pack_data: Vec<u8>,
     offset_to_index: HashMap<usize, usize>,
     base_hashes: HashMap<String, usize>,
-    resolved: HashMap<usize, ResolvedObject>,
+    children_remaining: Vec<usize>,
+    resolved: HashMap<usize, CachedResolvedObject>,
     on_progress: F,
     check_interrupt: C,
 }
@@ -67,11 +68,19 @@ where
             }
         }
 
+        let mut children_remaining = vec![0; pack.entries.len()];
+        for entry in &pack.entries {
+            if let Some(parent_index) = Self::parent_index(entry, &offset_to_index, &base_hashes)? {
+                children_remaining[parent_index] += 1;
+            }
+        }
+
         Ok(Self {
             pack,
             pack_data,
             offset_to_index,
             base_hashes,
+            children_remaining,
             resolved: HashMap::new(),
             on_progress,
             check_interrupt,
@@ -119,6 +128,7 @@ where
                 offset: entry.offset as u64,
                 crc32: crc32(&self.pack_data[entry.offset..entry.end_offset]),
             });
+            self.drop_body_if_unused(entry_index);
         }
 
         indexed.sort_by_key(|object| object.hash);
@@ -128,7 +138,7 @@ where
     fn resolve_entry(&mut self, index: usize) -> Result<ResolvedObject> {
         (self.check_interrupt)()?;
         if let Some(object) = self.resolved.get(&index) {
-            return Ok(object.clone());
+            return object.materialize();
         }
 
         let packed =
@@ -154,6 +164,7 @@ where
                     &delta,
                     &mut self.check_interrupt,
                 )?;
+                self.release_parent_body(base_index);
                 ResolvedObject {
                     hash: ObjectStore::object_hash(base.object_type, &body),
                     object_type: base.object_type,
@@ -172,6 +183,7 @@ where
                     &delta,
                     &mut self.check_interrupt,
                 )?;
+                self.release_parent_body(base_index);
                 ResolvedObject {
                     hash: ObjectStore::object_hash(base.object_type, &body),
                     object_type: base.object_type,
@@ -180,7 +192,8 @@ where
             }
         };
 
-        self.resolved.insert(index, object.clone());
+        self.resolved
+            .insert(index, CachedResolvedObject::from(&object));
         Ok(object)
     }
 
@@ -195,6 +208,44 @@ where
                 )
             })
             .count()
+    }
+
+    fn parent_index(
+        entry: &super::types::PackEntryInfo,
+        offset_to_index: &HashMap<usize, usize>,
+        base_hashes: &HashMap<String, usize>,
+    ) -> Result<Option<usize>> {
+        match &entry.kind {
+            PackEntryInfoKind::Base { .. } => Ok(None),
+            PackEntryInfoKind::OfsDelta { base_offset } => Ok(Some(
+                *offset_to_index
+                    .get(base_offset)
+                    .ok_or_else(|| anyhow!("missing ofs-delta base object"))?,
+            )),
+            PackEntryInfoKind::RefDelta { base_hash } => Ok(Some(
+                *base_hashes
+                    .get(base_hash)
+                    .ok_or_else(|| anyhow!("missing ref-delta base object"))?,
+            )),
+        }
+    }
+
+    fn release_parent_body(&mut self, parent_index: usize) {
+        let remaining = &mut self.children_remaining[parent_index];
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        self.drop_body_if_unused(parent_index);
+    }
+
+    fn drop_body_if_unused(&mut self, index: usize) {
+        if self.children_remaining[index] != 0 {
+            return;
+        }
+        if let Some(object) = self.resolved.get_mut(&index) {
+            object.body = None;
+        }
     }
 
     fn build_pack_index(objects: &[IndexedObject], pack_checksum: &[u8; 20]) -> Result<Vec<u8>> {
@@ -239,5 +290,36 @@ where
         let idx_checksum = Sha1::digest(&idx);
         idx.extend_from_slice(&idx_checksum);
         Ok(idx)
+    }
+}
+
+#[derive(Clone)]
+struct CachedResolvedObject {
+    hash: String,
+    object_type: ObjectType,
+    body: Option<Vec<u8>>,
+}
+
+impl CachedResolvedObject {
+    fn materialize(&self) -> Result<ResolvedObject> {
+        let body = self
+            .body
+            .clone()
+            .ok_or_else(|| anyhow!("resolved pack body evicted too early"))?;
+        Ok(ResolvedObject {
+            hash: self.hash.clone(),
+            object_type: self.object_type,
+            body,
+        })
+    }
+}
+
+impl From<&ResolvedObject> for CachedResolvedObject {
+    fn from(value: &ResolvedObject) -> Self {
+        Self {
+            hash: value.hash.clone(),
+            object_type: value.object_type,
+            body: Some(value.body.clone()),
+        }
     }
 }
