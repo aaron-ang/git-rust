@@ -5,8 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
-use flate2::{Decompress, FlushDecompress, Status};
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::data::object::{GIT_OBJECTS_DIR, GIT_PACK_DIR, ObjectStore, ObjectType};
 
@@ -248,8 +248,10 @@ impl PackObjectReader {
         };
 
         self.offset_cache.insert(cache_key, object.clone());
-        self.object_cache
-            .insert(object.hash.clone(), (object.object_type, object.body.clone()));
+        self.object_cache.insert(
+            object.hash.clone(),
+            (object.object_type, object.body.clone()),
+        );
         Ok(object)
     }
 

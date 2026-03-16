@@ -159,11 +159,9 @@ where
                     .ok_or_else(|| anyhow!("missing ofs-delta base object"))?;
                 let base = self.resolve_entry(base_index)?;
                 let delta = packed.into_delta()?;
-                let body = super::delta::apply_delta_with_interrupt(
-                    &base.body,
-                    &delta,
-                    || self.observer.check_interrupt(),
-                )?;
+                let body = super::delta::apply_delta_with_interrupt(&base.body, &delta, || {
+                    self.observer.check_interrupt()
+                })?;
                 self.release_parent_body(base_index);
                 ResolvedObject {
                     hash: ObjectStore::object_hash(base.object_type, &body),
@@ -178,11 +176,9 @@ where
                     .ok_or_else(|| anyhow!("missing ref-delta base object"))?;
                 let base = self.resolve_entry(base_index)?;
                 let delta = packed.into_delta()?;
-                let body = super::delta::apply_delta_with_interrupt(
-                    &base.body,
-                    &delta,
-                    || self.observer.check_interrupt(),
-                )?;
+                let body = super::delta::apply_delta_with_interrupt(&base.body, &delta, || {
+                    self.observer.check_interrupt()
+                })?;
                 self.release_parent_body(base_index);
                 ResolvedObject {
                     hash: ObjectStore::object_hash(base.object_type, &body),

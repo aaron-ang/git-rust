@@ -8,9 +8,7 @@ use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use sha1::{Digest, Sha1};
 use strum::{Display, EnumString};
 
-use crate::pack::{
-    access::PackObjectReader,
-};
+use crate::pack::access::PackObjectReader;
 
 pub const GIT_DIR: &str = ".git";
 pub const GIT_OBJECTS_DIR: &str = "objects";
