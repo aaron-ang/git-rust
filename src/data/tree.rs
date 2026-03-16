@@ -34,6 +34,11 @@ pub struct TreeEntry {
 #[derive(Deref)]
 pub struct Tree(Vec<TreeEntry>);
 
+pub(crate) trait CheckoutObserver {
+    fn check_interrupt(&self) -> Result<()>;
+    fn on_file_updated(&self, updated_files: usize) -> Result<()>;
+}
+
 impl Tree {
     pub fn read(hash: &str) -> Result<Self> {
         Self::read_from(&ObjectStore::default(), hash)
@@ -45,17 +50,17 @@ impl Tree {
         Self::write_dir(&store, &cwd)
     }
 
-    pub fn checkout_in_with_progress<F>(
+    pub(crate) fn checkout_in_with_progress<O>(
         store: &ObjectStore,
         tree_sha: &str,
         root: &Path,
-        on_update: &mut F,
+        observer: &O,
     ) -> Result<()>
     where
-        F: FnMut(usize) -> Result<()>,
+        O: CheckoutObserver,
     {
         let mut updated_files = 0;
-        Self::checkout_tree(store, tree_sha, root, &mut updated_files, on_update)
+        Self::checkout_tree(store, tree_sha, root, &mut updated_files, observer)
     }
 
     pub fn count_checkout_items_in(store: &ObjectStore, tree_sha: &str) -> Result<usize> {
@@ -71,28 +76,30 @@ impl Tree {
         Ok(count)
     }
 
-    fn checkout_tree<F>(
+    fn checkout_tree<O>(
         store: &ObjectStore,
         tree_sha: &str,
         root: &Path,
         updated_files: &mut usize,
-        on_update: &mut F,
+        observer: &O,
     ) -> Result<()>
     where
-        F: FnMut(usize) -> Result<()>,
+        O: CheckoutObserver,
     {
         let tree = Self::read_from(store, tree_sha)?;
         for entry in tree.iter() {
             let path = root.join(&entry.name);
             if entry.mode == TreeEntryMode::Directory {
+                observer.check_interrupt()?;
                 fs::create_dir_all(&path)?;
-                Self::checkout_tree(store, &entry.hash, &path, updated_files, on_update)?;
+                Self::checkout_tree(store, &entry.hash, &path, updated_files, observer)?;
                 continue;
             }
 
+            observer.check_interrupt()?;
             Self::checkout_entry(store, entry, &path)?;
             *updated_files += 1;
-            on_update(*updated_files)?;
+            observer.on_file_updated(*updated_files)?;
         }
         Ok(())
     }

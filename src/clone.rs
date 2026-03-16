@@ -1,10 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -19,9 +19,9 @@ use signal_hook::{
 use crate::{
     commit::Commit,
     data::object::{GIT_DIR, GIT_HEAD_FILE, GIT_OBJECTS_DIR, GIT_REFS_DIR, ObjectStore},
-    data::tree::Tree,
+    data::tree::{CheckoutObserver, Tree},
     error::{GitError, GitResult},
-    pack::index::index_pack,
+    pack::index::{PackIndexObserver, index_pack},
     remote::RemoteClient,
 };
 
@@ -44,13 +44,12 @@ impl Clone {
                     .trim_end_matches('/')
                     .rsplit('/')
                     .next()
-                    .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))
+                    .map(|segment| segment.trim_end_matches(".git"))
                     .filter(|segment| !segment.is_empty())
                     .ok_or(GitError::CantGuessCloneTarget)?;
                 PathBuf::from(repo_name)
             }
         };
-
         Ok(Self {
             repo_url,
             target_dir,
@@ -58,108 +57,8 @@ impl Clone {
     }
 
     fn execute(&self) -> GitResult<()> {
-        let progress = RefCell::new(ProgressRenderer::default());
         self.ensure_empty_target()?;
-        Self::install_signal_handler()?;
-        Self::reset_interrupt_state();
-
-        let result = {
-            let mut target_dir_guard = CloneTargetDir::new(&self.target_dir)?;
-            (|| -> GitResult<()> {
-                progress
-                    .borrow_mut()
-                    .print_line(&format!("Cloning into '{}'...", self.target_dir.display()));
-
-                let git_dir = Self::init_repo_layout(target_dir_guard.path())?;
-                let store = ObjectStore::new(git_dir.clone());
-
-                let remote = RemoteClient::new(&self.repo_url)?;
-                let discovery = remote.discover()?;
-                Self::check_interrupt()?;
-                progress.borrow_mut().start_receiving();
-                let fetch_started = Instant::now();
-                Self::set_disconnect_message_active(true);
-                let parsed_pack = remote.fetch_packfile(
-                    &store.pack_dir(),
-                    &discovery.head_hash,
-                    &discovery.capabilities,
-                    |msg| {
-                        Self::check_interrupt()?;
-                        progress.borrow_mut().remote_chunk(msg);
-                        Ok(())
-                    },
-                    |pack_bytes, total_objects, received_objects| {
-                        Self::check_interrupt()?;
-                        Self::set_disconnect_message_active(false);
-                        progress.borrow_mut().update_pack_progress(
-                            pack_bytes,
-                            total_objects,
-                            received_objects,
-                        );
-                        Ok(())
-                    },
-                );
-                Self::set_disconnect_message_active(false);
-                let parsed_pack = parsed_pack?;
-                Self::check_interrupt()?;
-                let fetch_elapsed = fetch_started.elapsed();
-                progress.borrow_mut().finish_remote_output();
-                progress.borrow_mut().finish_receiving(fetch_elapsed);
-
-                let unpack_started = Instant::now();
-                let stats = index_pack(
-                    &store,
-                    &parsed_pack,
-                    |progress_update| {
-                        Self::check_interrupt()?;
-                        progress.borrow_mut().resolving_update(
-                            progress_update.resolved_deltas,
-                            progress_update.total_deltas,
-                        );
-                        Ok(())
-                    },
-                    Self::check_interrupt,
-                )?;
-                let unpack_elapsed = unpack_started.elapsed();
-
-                Self::write_refs(&git_dir, &discovery.head_ref, &discovery.head_hash)?;
-
-                let root_tree = Commit::root_tree_in(&store, &discovery.head_hash)?;
-                Self::check_interrupt()?;
-                progress
-                    .borrow_mut()
-                    .finish_resolving(stats.deltas, unpack_elapsed);
-
-                let total_files = Tree::count_checkout_items_in(&store, &root_tree)?;
-                Self::check_interrupt()?;
-                Tree::checkout_in_with_progress(
-                    &store,
-                    &root_tree,
-                    target_dir_guard.path(),
-                    &mut |updated_files| {
-                        Self::check_interrupt()?;
-                        progress
-                            .borrow_mut()
-                            .updating_files_update(updated_files, total_files);
-                        Ok(())
-                    },
-                )?;
-                progress.borrow_mut().finish_updating_files(total_files);
-                target_dir_guard.finish();
-
-                Ok(())
-            })()
-        };
-
-        if let Some(interrupt) = Self::take_pending_interrupt() {
-            if interrupt.emit_disconnect_message {
-                eprintln!("fetch-pack: unexpected disconnect while reading sideband packets");
-            }
-            process::exit(128 + interrupt.signal);
-        }
-
-        Self::reset_interrupt_state();
-        result
+        CloneRunner::new(self).run()
     }
 
     fn ensure_empty_target(&self) -> GitResult<()> {
@@ -178,125 +77,266 @@ impl Clone {
 
         Ok(())
     }
+}
 
-    fn init_repo_layout(target_dir: &Path) -> GitResult<PathBuf> {
-        let git_dir = target_dir.join(GIT_DIR);
-        fs::create_dir_all(git_dir.join(GIT_OBJECTS_DIR))?;
-        fs::create_dir_all(git_dir.join(GIT_REFS_DIR))?;
-        Ok(git_dir)
+struct CloneRunner<'a> {
+    clone: &'a Clone,
+    interruption: CloneInterrupt,
+    checkout_total_files: Cell<usize>,
+    progress: RefCell<ProgressRenderer>,
+}
+
+impl<'a> CloneRunner<'a> {
+    fn new(clone: &'a Clone) -> Self {
+        Self {
+            clone,
+            interruption: CloneInterrupt::new(),
+            checkout_total_files: Cell::new(0),
+            progress: RefCell::new(ProgressRenderer::default()),
+        }
     }
 
-    fn write_refs(git_dir: &Path, head_ref: &str, head_hash: &str) -> GitResult<()> {
-        fs::write(git_dir.join(GIT_HEAD_FILE), format!("ref: {head_ref}\n"))?;
-        let ref_path = git_dir.join(head_ref);
-        if let Some(parent) = ref_path.parent() {
-            fs::create_dir_all(parent)?;
+    fn run(&self) -> GitResult<()> {
+        self.interruption.install_handler()?;
+        self.interruption.reset();
+
+        let result = {
+            let mut target_dir_guard = CloneTargetDir::new(&self.clone.target_dir)?;
+            self.run_inner(&mut target_dir_guard)
+        };
+
+        if let Some(signal) = self.interruption.take_pending() {
+            process::exit(128 + signal);
         }
-        fs::write(ref_path, format!("{head_hash}\n"))?;
+
+        self.interruption.reset();
+        result
+    }
+
+    fn run_inner(&self, target_dir_guard: &mut CloneTargetDir) -> GitResult<()> {
+        self.print_clone_banner();
+
+        let git_dir = self.init_repo_layout(target_dir_guard.path())?;
+        let store = ObjectStore::new(git_dir.clone());
+
+        let remote = RemoteClient::new(&self.clone.repo_url)?;
+        let discovery = remote.discover()?;
+        self.check_interrupt()?;
+        self.start_receiving();
+        let fetch_started = Instant::now();
+        let parsed_pack = remote.fetch_packfile(
+            &store.pack_dir(),
+            &discovery.head_hash,
+            &discovery.capabilities,
+            |msg| self.on_remote_chunk(msg),
+            |pack_bytes, total_objects, received_objects| {
+                self.on_pack_progress(pack_bytes, total_objects, received_objects)
+            },
+        );
+        let parsed_pack = parsed_pack?;
+        self.check_interrupt()?;
+        let fetch_elapsed = fetch_started.elapsed();
+        self.finish_receiving(fetch_elapsed);
+
+        let unpack_started = Instant::now();
+        let stats = index_pack(&store, &parsed_pack, self)?;
+        let unpack_elapsed = unpack_started.elapsed();
+
+        self.write_refs(&git_dir, &discovery.head_ref, &discovery.head_hash)?;
+
+        let root_tree = Commit::root_tree_in(&store, &discovery.head_hash)?;
+        self.check_interrupt()?;
+        self.progress
+            .borrow_mut()
+            .finish_resolving(stats.deltas, unpack_elapsed);
+
+        let total_files = Tree::count_checkout_items_in(&store, &root_tree)?;
+        self.checkout_total_files.set(total_files);
+        self.check_interrupt()?;
+        Tree::checkout_in_with_progress(&store, &root_tree, target_dir_guard.path(), self)?;
+        self.progress
+            .borrow_mut()
+            .finish_updating_files(total_files);
+        target_dir_guard.finish();
+
         Ok(())
     }
 
-    fn install_signal_handler() -> GitResult<()> {
+    fn init_repo_layout(&self, target_dir: &Path) -> GitResult<PathBuf> {
+        let git_dir = target_dir.join(GIT_DIR);
+        self.create_dir_all(&git_dir.join(GIT_OBJECTS_DIR))?;
+        self.create_dir_all(&git_dir.join(GIT_REFS_DIR))?;
+        Ok(git_dir)
+    }
+
+    fn write_refs(&self, git_dir: &Path, head_ref: &str, head_hash: &str) -> GitResult<()> {
+        self.write_file(&git_dir.join(GIT_HEAD_FILE), format!("ref: {head_ref}\n"))?;
+        let ref_path = git_dir.join(head_ref);
+        if let Some(parent) = ref_path.parent() {
+            self.create_dir_all(parent)?;
+        }
+        self.write_file(&ref_path, format!("{head_hash}\n"))?;
+        Ok(())
+    }
+
+    fn print_clone_banner(&self) {
+        self.progress.borrow_mut().print_line(&format!(
+            "Cloning into '{}'...",
+            self.clone.target_dir.display()
+        ));
+    }
+
+    fn start_receiving(&self) {
+        self.progress.borrow_mut().start_receiving();
+    }
+
+    fn finish_receiving(&self, elapsed: std::time::Duration) {
+        self.progress.borrow_mut().finish_remote_output();
+        self.progress.borrow_mut().finish_receiving(elapsed);
+    }
+
+    fn on_remote_chunk(&self, msg: &str) -> Result<()> {
+        self.check_interrupt()?;
+        self.progress.borrow_mut().remote_chunk(msg);
+        Ok(())
+    }
+
+    fn on_pack_progress(
+        &self,
+        pack_bytes: usize,
+        total_objects: Option<usize>,
+        received_objects: usize,
+    ) -> Result<()> {
+        self.check_interrupt()?;
+        self.progress.borrow_mut().update_pack_progress(
+            pack_bytes,
+            total_objects,
+            received_objects,
+        );
+        Ok(())
+    }
+
+    fn on_resolving_progress(&self, resolved_deltas: usize, total_deltas: usize) -> Result<()> {
+        self.check_interrupt()?;
+        self.progress
+            .borrow_mut()
+            .resolving_update(resolved_deltas, total_deltas);
+        Ok(())
+    }
+
+    fn on_updating_files_progress(&self, updated_files: usize, total_files: usize) -> Result<()> {
+        self.check_interrupt()?;
+        self.progress
+            .borrow_mut()
+            .updating_files_update(updated_files, total_files);
+        Ok(())
+    }
+
+    fn create_dir_all(&self, path: &Path) -> GitResult<()> {
+        self.check_interrupt()?;
+        fs::create_dir_all(path)?;
+        Ok(())
+    }
+
+    fn write_file(&self, path: &Path, contents: impl AsRef<[u8]>) -> GitResult<()> {
+        self.check_interrupt()?;
+        fs::write(path, contents)?;
+        Ok(())
+    }
+
+    fn check_interrupt(&self) -> Result<()> {
+        self.interruption.check()
+    }
+}
+
+impl PackIndexObserver for CloneRunner<'_> {
+    fn check_interrupt(&self) -> Result<()> {
+        CloneRunner::check_interrupt(self)
+    }
+
+    fn on_progress(&self, progress: crate::pack::types::UnpackProgress) -> Result<()> {
+        CloneRunner::on_resolving_progress(self, progress.resolved_deltas, progress.total_deltas)
+    }
+}
+
+impl CheckoutObserver for CloneRunner<'_> {
+    fn check_interrupt(&self) -> Result<()> {
+        CloneRunner::check_interrupt(self)
+    }
+
+    fn on_file_updated(&self, updated_files: usize) -> Result<()> {
+        CloneRunner::on_updating_files_progress(
+            self,
+            updated_files,
+            self.checkout_total_files.get(),
+        )
+    }
+}
+
+struct CloneInterrupt {
+    handler_installed: &'static OnceLock<()>,
+    signal: &'static AtomicI32,
+}
+
+impl CloneInterrupt {
+    fn new() -> Self {
         static HANDLER_INSTALLED: OnceLock<()> = OnceLock::new();
-        if HANDLER_INSTALLED.get().is_some() {
+        static SIGNAL: AtomicI32 = AtomicI32::new(0);
+        Self {
+            handler_installed: &HANDLER_INSTALLED,
+            signal: &SIGNAL,
+        }
+    }
+
+    fn install_handler(&self) -> GitResult<()> {
+        if self.handler_installed.get().is_some() {
             return Ok(());
         }
 
-        let mut signals = Signals::new(Self::signal_cleanup_signals())?;
+        let mut signals = Signals::new(Self::cleanup_signals())?;
+        let pending_signal = self.signal;
         thread::spawn(move || {
-            if let Some(signal) = signals.forever().next() {
-                let state = Clone::signal_state();
-                if state
-                    .interrupted
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            for signal in signals.forever() {
+                if pending_signal
+                    .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
-                    state.signal.store(signal, Ordering::SeqCst);
-                    state.emit_disconnect_message.store(
-                        state.disconnect_message_active.load(Ordering::SeqCst),
-                        Ordering::SeqCst,
-                    );
+                    break;
                 }
             }
         });
 
-        let _ = HANDLER_INSTALLED.set(());
+        let _ = self.handler_installed.set(());
         Ok(())
     }
 
     #[cfg(windows)]
-    fn signal_cleanup_signals() -> &'static [i32] {
+    fn cleanup_signals() -> &'static [i32] {
         &[SIGINT, SIGTERM]
     }
 
     #[cfg(not(windows))]
-    fn signal_cleanup_signals() -> &'static [i32] {
+    fn cleanup_signals() -> &'static [i32] {
         &[SIGHUP, SIGINT, SIGQUIT, SIGTERM]
     }
 
-    fn signal_state() -> &'static CloneSignalState {
-        static STATE: CloneSignalState = CloneSignalState::new();
-        &STATE
+    fn reset(&self) {
+        self.signal.store(0, Ordering::SeqCst);
     }
 
-    fn reset_interrupt_state() {
-        let state = Self::signal_state();
-        state.interrupted.store(false, Ordering::SeqCst);
-        state.signal.store(0, Ordering::SeqCst);
-        state.emit_disconnect_message.store(false, Ordering::SeqCst);
-        state
-            .disconnect_message_active
-            .store(false, Ordering::SeqCst);
-    }
-
-    fn set_disconnect_message_active(active: bool) {
-        Self::signal_state()
-            .disconnect_message_active
-            .store(active, Ordering::SeqCst);
-    }
-
-    fn take_pending_interrupt() -> Option<CloneInterrupt> {
-        let state = Self::signal_state();
-        if state.interrupted.swap(false, Ordering::SeqCst) {
-            return Some(CloneInterrupt {
-                signal: state.signal.swap(0, Ordering::SeqCst),
-                emit_disconnect_message: state
-                    .emit_disconnect_message
-                    .swap(false, Ordering::SeqCst),
-            });
+    fn take_pending(&self) -> Option<i32> {
+        let signal = self.signal.swap(0, Ordering::SeqCst);
+        if signal != 0 {
+            return Some(signal);
         }
         None
     }
 
-    fn check_interrupt() -> Result<()> {
-        if Self::signal_state().interrupted.load(Ordering::SeqCst) {
+    fn check(&self) -> Result<()> {
+        if self.signal.load(Ordering::SeqCst) != 0 {
             bail!("clone interrupted")
         } else {
             Ok(())
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct CloneInterrupt {
-    signal: i32,
-    emit_disconnect_message: bool,
-}
-
-struct CloneSignalState {
-    interrupted: AtomicBool,
-    signal: AtomicI32,
-    emit_disconnect_message: AtomicBool,
-    disconnect_message_active: AtomicBool,
-}
-
-impl CloneSignalState {
-    const fn new() -> Self {
-        Self {
-            interrupted: AtomicBool::new(false),
-            signal: AtomicI32::new(0),
-            emit_disconnect_message: AtomicBool::new(false),
-            disconnect_message_active: AtomicBool::new(false),
         }
     }
 }
@@ -311,9 +351,7 @@ impl CloneTargetDir {
     fn new(target_dir: &Path) -> GitResult<Self> {
         let path = Self::absolute_path(target_dir)?;
         let existed_before = path.exists();
-        if !existed_before {
-            fs::create_dir_all(&path)?;
-        }
+        fs::create_dir_all(&path)?;
 
         Ok(Self {
             path,
@@ -664,7 +702,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_clone_target_rejects_non_empty_directory() {
+    fn clone_target_allows_existing_empty_directory() {
+        let temp = tempdir().unwrap();
+
+        let clone = Clone::new(
+            "https://github.com/example/repo.git",
+            Some(temp.path().into()),
+        )
+        .unwrap();
+        clone.ensure_empty_target().unwrap();
+    }
+
+    #[test]
+    fn clone_target_rejects_non_empty_directory() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("README.md"), b"hello").unwrap();
 
@@ -763,21 +813,6 @@ mod tests {
 
         assert!(renderer.active_line);
         assert_eq!(renderer.last_received_percent, Some(99));
-    }
-
-    #[test]
-    fn clone_signal_state_tracks_disconnect_message_separately() {
-        Clone::reset_interrupt_state();
-        Clone::set_disconnect_message_active(true);
-        let state = Clone::signal_state();
-        assert!(!state.interrupted.load(Ordering::SeqCst));
-        assert!(state.disconnect_message_active.load(Ordering::SeqCst));
-
-        Clone::set_disconnect_message_active(false);
-        assert!(!state.interrupted.load(Ordering::SeqCst));
-        assert!(!state.disconnect_message_active.load(Ordering::SeqCst));
-
-        Clone::reset_interrupt_state();
     }
 
     #[test]

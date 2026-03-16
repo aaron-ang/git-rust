@@ -12,23 +12,25 @@ use super::types::{
     UnpackStats,
 };
 
-pub(crate) fn index_pack<F, C>(
-    _store: &ObjectStore,
-    pack: &ParsedPack,
-    on_progress: F,
-    check_interrupt: C,
-) -> Result<UnpackStats>
-where
-    F: FnMut(UnpackProgress) -> Result<()>,
-    C: FnMut() -> Result<()>,
-{
-    PackIndexer::new(pack, on_progress, check_interrupt)?.index()
+pub(crate) trait PackIndexObserver {
+    fn check_interrupt(&self) -> Result<()>;
+    fn on_progress(&self, progress: UnpackProgress) -> Result<()>;
 }
 
-struct PackIndexer<'a, F, C>
+pub(crate) fn index_pack<O>(
+    _store: &ObjectStore,
+    pack: &ParsedPack,
+    observer: &O,
+) -> Result<UnpackStats>
 where
-    F: FnMut(UnpackProgress) -> Result<()>,
-    C: FnMut() -> Result<()>,
+    O: PackIndexObserver,
+{
+    PackIndexer::new(pack, observer)?.index()
+}
+
+struct PackIndexer<'a, O>
+where
+    O: PackIndexObserver,
 {
     pack: &'a ParsedPack,
     pack_data: Vec<u8>,
@@ -36,16 +38,14 @@ where
     base_hashes: HashMap<String, usize>,
     children_remaining: Vec<usize>,
     resolved: HashMap<usize, CachedResolvedObject>,
-    on_progress: F,
-    check_interrupt: C,
+    observer: &'a O,
 }
 
-impl<'a, F, C> PackIndexer<'a, F, C>
+impl<'a, O> PackIndexer<'a, O>
 where
-    F: FnMut(UnpackProgress) -> Result<()>,
-    C: FnMut() -> Result<()>,
+    O: PackIndexObserver,
 {
-    fn new(pack: &'a ParsedPack, on_progress: F, check_interrupt: C) -> Result<Self> {
+    fn new(pack: &'a ParsedPack, observer: &'a O) -> Result<Self> {
         let pack_data = fs::read(&pack.pack_path)?;
         if pack_data.len() < 20 {
             bail!("pack file too short");
@@ -82,13 +82,13 @@ where
             base_hashes,
             children_remaining,
             resolved: HashMap::new(),
-            on_progress,
-            check_interrupt,
+            observer,
         })
     }
 
     fn index(mut self) -> Result<UnpackStats> {
         let indexed = self.resolve_indexed_objects()?;
+        self.observer.check_interrupt()?;
         fs::write(
             self.pack.pack_path.with_extension("idx"),
             Self::build_pack_index(&indexed, &self.pack.pack_checksum)?,
@@ -108,7 +108,7 @@ where
         let total_objects = self.pack.entries.len();
 
         for (entry_index, entry) in self.pack.entries.iter().enumerate() {
-            (self.check_interrupt)()?;
+            self.observer.check_interrupt()?;
             let object = self.resolve_entry(entry_index)?;
             if matches!(
                 entry.kind,
@@ -116,7 +116,7 @@ where
             ) {
                 resolved_deltas += 1;
             }
-            (self.on_progress)(UnpackProgress {
+            self.observer.on_progress(UnpackProgress {
                 received_objects: entry_index + 1,
                 total_objects,
                 resolved_deltas,
@@ -136,7 +136,7 @@ where
     }
 
     fn resolve_entry(&mut self, index: usize) -> Result<ResolvedObject> {
-        (self.check_interrupt)()?;
+        self.observer.check_interrupt()?;
         if let Some(object) = self.resolved.get(&index) {
             return object.materialize();
         }
@@ -162,7 +162,7 @@ where
                 let body = super::delta::apply_delta_with_interrupt(
                     &base.body,
                     &delta,
-                    &mut self.check_interrupt,
+                    || self.observer.check_interrupt(),
                 )?;
                 self.release_parent_body(base_index);
                 ResolvedObject {
@@ -181,7 +181,7 @@ where
                 let body = super::delta::apply_delta_with_interrupt(
                     &base.body,
                     &delta,
-                    &mut self.check_interrupt,
+                    || self.observer.check_interrupt(),
                 )?;
                 self.release_parent_body(base_index);
                 ResolvedObject {

@@ -181,9 +181,21 @@ impl ObjectStore {
 mod tests {
     use super::*;
     use crate::data::blob::Blob;
-    use crate::pack::index::index_pack;
+    use crate::pack::index::{PackIndexObserver, index_pack};
     use crate::pack::stream::PackStream;
     use tempfile::tempdir;
+
+    struct NoopObserver;
+
+    impl PackIndexObserver for NoopObserver {
+        fn check_interrupt(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_progress(&self, _progress: crate::pack::types::UnpackProgress) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_object_path() {
@@ -231,7 +243,7 @@ mod tests {
         let pack = build_pack_from_payload(&loose);
         stream.append(&pack).unwrap();
         let parsed = stream.finish().unwrap();
-        index_pack(&store, &parsed, |_| Ok(()), || Ok(())).unwrap();
+        index_pack(&store, &parsed, &NoopObserver).unwrap();
         fs::remove_file(store.object_path(&hash).unwrap()).unwrap();
 
         let (object_type, body) = store.read_object_body(&hash).unwrap();
